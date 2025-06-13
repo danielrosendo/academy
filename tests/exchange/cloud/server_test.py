@@ -17,7 +17,7 @@ from aiohttp.web import Request
 
 from academy.exception import BadEntityIdError
 from academy.exception import MailboxClosedError
-from academy.exchange.cloud.client import HttpExchange
+from academy.exchange.cloud.client import HttpExchangeFactory
 from academy.exchange.cloud.config import ExchangeAuthConfig
 from academy.exchange.cloud.config import ExchangeServingConfig
 from academy.exchange.cloud.exceptions import ForbiddenError
@@ -68,14 +68,17 @@ def test_server_run() -> None:
 
     while True:
         try:
-            exchange = HttpExchange(config.host, config.port, scheme='http')
-            exchange.register_client()
+            exchange = HttpExchangeFactory(
+                config.host,
+                config.port,
+                scheme='http',
+            ).bind_as_client()
         except OSError:  # pragma: no cover
             time.sleep(0.01)
         else:
-            # Coverage doesn't detect the singular break but it does
-            # get executed to break from the loop
-            break  # pragma: no cover
+            exchange.close()
+            break
+
     process.terminate()
     process.join()
 
@@ -91,19 +94,18 @@ def test_server_run_ssl(ssl_context: SSLContextFixture) -> None:
 
     while True:
         try:
-            exchange = HttpExchange(
+            exchange = HttpExchangeFactory(
                 config.host,
                 config.port,
                 scheme='https',
                 ssl_verify=False,
-            )
-            exchange.register_client()
+            ).bind_as_client()
         except OSError:  # pragma: no cover
             time.sleep(0.01)
         else:
-            # Coverage doesn't detect the singular break but it does
-            # get executed to break from the loop
-            break  # pragma: no cover
+            exchange.close()
+            break
+
     process.terminate()
     process.join()
 
