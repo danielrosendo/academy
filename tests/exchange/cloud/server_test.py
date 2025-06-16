@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import multiprocessing
 import pathlib
 import time
@@ -17,6 +18,7 @@ from aiohttp.web import Request
 
 from academy.exception import BadEntityIdError
 from academy.exception import MailboxClosedError
+from academy.exchange import MailboxStatus
 from academy.exchange.cloud.client import HttpExchangeFactory
 from academy.exchange.cloud.config import ExchangeAuthConfig
 from academy.exchange.cloud.config import ExchangeServingConfig
@@ -29,6 +31,7 @@ from academy.exchange.cloud.server import _main
 from academy.exchange.cloud.server import _NOT_FOUND_CODE
 from academy.exchange.cloud.server import _OKAY_CODE
 from academy.exchange.cloud.server import _run
+from academy.exchange.cloud.server import _TIMEOUT_CODE
 from academy.exchange.cloud.server import _UNAUTHORIZED_CODE
 from academy.exchange.cloud.server import create_app
 from academy.identifier import AgentId
@@ -61,30 +64,39 @@ client_id = "ABC"
 
 
 def test_server_run() -> None:
-    config = ExchangeServingConfig(host='127.0.0.1', port=open_port())
+    config = ExchangeServingConfig(
+        host='127.0.0.1',
+        port=open_port(),
+        log_level=logging.ERROR,
+    )
     context = multiprocessing.get_context('spawn')
     process = context.Process(target=_run, args=(config,))
     process.start()
 
     while True:
         try:
-            exchange = HttpExchangeFactory(
+            client = HttpExchangeFactory(
                 config.host,
                 config.port,
                 scheme='http',
-            ).bind_as_client()
+            ).create_user_client()
         except OSError:  # pragma: no cover
             time.sleep(0.01)
         else:
-            exchange.close()
+            client.close()
             break
 
     process.terminate()
     process.join()
 
 
+@pytest.mark.filterwarnings('ignore:Unverified HTTPS request is being made')
 def test_server_run_ssl(ssl_context: SSLContextFixture) -> None:
-    config = ExchangeServingConfig(host='127.0.0.1', port=open_port())
+    config = ExchangeServingConfig(
+        host='127.0.0.1',
+        port=open_port(),
+        log_level=logging.ERROR,
+    )
     config.certfile = ssl_context.certfile
     config.keyfile = ssl_context.keyfile
 
@@ -94,16 +106,16 @@ def test_server_run_ssl(ssl_context: SSLContextFixture) -> None:
 
     while True:
         try:
-            exchange = HttpExchangeFactory(
+            client = HttpExchangeFactory(
                 config.host,
                 config.port,
                 scheme='https',
                 ssl_verify=False,
-            ).bind_as_client()
+            ).create_user_client()
         except OSError:  # pragma: no cover
             time.sleep(0.01)
         else:
-            exchange.close()
+            client.close()
             break
 
     process.terminate()
@@ -117,9 +129,9 @@ async def test_mailbox_manager_create_close() -> None:
     uid = ClientId.new()
     # Should do nothing since mailbox doesn't exist
     await manager.terminate(user_id, uid)
-    assert not manager.check_mailbox(user_id, uid)
+    assert manager.check_mailbox(user_id, uid) == MailboxStatus.MISSING
     manager.create_mailbox(user_id, uid)
-    assert manager.check_mailbox(user_id, uid)
+    assert manager.check_mailbox(user_id, uid) == MailboxStatus.ACTIVE
     manager.create_mailbox(user_id, uid)  # Idempotent check
 
     bad_user = str(uuid.uuid4())  # Authentication check
@@ -236,6 +248,22 @@ async def test_recv_mailbox_validation_error(cli) -> None:
     )
     assert response.status == _NOT_FOUND_CODE
     assert await response.text() == 'Unknown mailbox ID'
+
+
+@pytest.mark.asyncio
+async def test_recv_timeout_error(cli) -> None:
+    uid = ClientId.new()
+    response = await cli.post(
+        '/mailbox',
+        json={'mailbox': uid.model_dump_json()},
+    )
+    assert response.status == _OKAY_CODE
+
+    response = await cli.get(
+        '/message',
+        json={'mailbox': uid.model_dump_json(), 'timeout': 0.001},
+    )
+    assert response.status == _TIMEOUT_CODE
 
 
 @pytest.mark.asyncio

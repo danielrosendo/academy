@@ -1,144 +1,50 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+import pickle
 from unittest import mock
 
 import pytest
 import requests
 
-from academy.behavior import Behavior
-from academy.exception import BadEntityIdError
-from academy.exception import MailboxClosedError
-from academy.exchange import ExchangeClient
-from academy.exchange.cloud.client import HttpExchangeClient
 from academy.exchange.cloud.client import HttpExchangeFactory
+from academy.exchange.cloud.client import HttpExchangeTransport
 from academy.exchange.cloud.client import spawn_http_exchange
-from academy.identifier import AgentId
-from academy.identifier import ClientId
-from academy.message import PingRequest
+from academy.exchange.cloud.server import _TIMEOUT_CODE
 from academy.socket import open_port
-from testing.behavior import EmptyBehavior
 from testing.constant import TEST_CONNECTION_TIMEOUT
-from testing.constant import TEST_SLEEP
 
 
-def test_simple_exchange_repr(http_exchange_server: tuple[str, int]) -> None:
-    host, port = http_exchange_server
-    with HttpExchangeFactory(host, port).bind_as_client() as exchange:
-        assert isinstance(repr(exchange), str)
-        assert isinstance(str(exchange), str)
-
-
-def test_create_terminate(http_exchange_server: tuple[str, int]) -> None:
-    host, port = http_exchange_server
-    with HttpExchangeFactory(host, port).bind_as_client() as exchange:
-        aid = exchange.register_agent(EmptyBehavior)
-        exchange.register_agent(
-            EmptyBehavior,
-            agent_id=aid,
-        )  # Idempotency check
-        exchange.terminate(aid)
-        exchange.terminate(aid)  # Idempotency check
-
-
-def test_create_mailbox_bad_identifier(
-    http_exchange_server: tuple[str, int],
+def test_factory_serialize(
+    http_exchange_factory: HttpExchangeFactory,
 ) -> None:
-    host, port = http_exchange_server
-    aid: AgentId[Any] = AgentId.new()
-    with pytest.raises(BadEntityIdError):
-        HttpExchangeFactory(host, port).bind_as_agent(agent_id=aid)
-
-
-def test_send_and_recv(http_exchange_server: tuple[str, int]) -> None:
-    host, port = http_exchange_server
-    with HttpExchangeFactory(host, port).bind_as_client() as exchange:
-        cid = exchange.mailbox_id
-        aid = exchange.register_agent(EmptyBehavior)
-
-        message = PingRequest(src=cid, dest=aid)
-        exchange.send(aid, message)
-
-        with exchange.clone().bind_as_agent(
-            agent_id=aid,
-        ) as mailbox:
-            assert mailbox.recv(timeout=TEST_CONNECTION_TIMEOUT) == message
-
-
-def test_send_bad_identifer(http_exchange_server: tuple[str, int]) -> None:
-    host, port = http_exchange_server
-    cid = ClientId.new()
-    with HttpExchangeFactory(host, port).bind_as_client() as exchange:
-        message = PingRequest(src=exchange.mailbox_id, dest=cid)
-        with pytest.raises(BadEntityIdError):
-            exchange.send(cid, message)
-
-
-def test_send_mailbox_closed(http_exchange_server: tuple[str, int]) -> None:
-    host, port = http_exchange_server
-    with HttpExchangeFactory(host, port).bind_as_client() as exchange:
-        aid = exchange.register_agent(EmptyBehavior)
-        exchange.terminate(aid)
-        message = PingRequest(src=aid, dest=aid)
-        with pytest.raises(MailboxClosedError):
-            exchange.send(aid, message)
+    pickled = pickle.dumps(http_exchange_factory)
+    reconstructed = pickle.loads(pickled)
+    assert isinstance(reconstructed, HttpExchangeFactory)
 
 
 def test_recv_timeout(http_exchange_server: tuple[str, int]) -> None:
     host, port = http_exchange_server
-    with HttpExchangeFactory(host, port).bind_as_client() as exchange:
-        assert isinstance(exchange, HttpExchangeClient)
-
+    factory = HttpExchangeFactory(host, port)
+    with factory._create_transport() as transport:
+        response = requests.Response()
+        response.status_code = _TIMEOUT_CODE
         with mock.patch.object(
-            exchange._session,
+            transport._session,
             'get',
-            side_effect=requests.exceptions.Timeout,
+            return_value=response,
         ):
             with pytest.raises(TimeoutError):
-                assert exchange.recv(timeout=TEST_SLEEP)
-
-
-def test_recv_mailbox_closed(http_exchange_server: tuple[str, int]) -> None:
-    host, port = http_exchange_server
-    with HttpExchangeFactory(host, port).bind_as_client() as exchange:
-        aid = exchange.register_agent(EmptyBehavior)
-        exchange.terminate(aid)
-        with pytest.raises(BadEntityIdError):
-            exchange.clone().bind_as_agent(agent_id=aid)
-
-
-class A(Behavior): ...
-
-
-class B(Behavior): ...
-
-
-class C(B): ...
-
-
-def test_exchange_discover(http_exchange_server: tuple[str, int]) -> None:
-    host, port = http_exchange_server
-    with HttpExchangeFactory(host, port).bind_as_client() as exchange:
-        bid = exchange.register_agent(B)
-        cid = exchange.register_agent(C)
-        did = exchange.register_agent(C)
-        exchange.terminate(did)
-
-        assert len(exchange.discover(A)) == 0
-        assert exchange.discover(B, allow_subclasses=False) == (bid,)
-        assert exchange.discover(B, allow_subclasses=True) == (bid, cid)
+                transport.recv()
 
 
 def test_additional_headers(http_exchange_server: tuple[str, int]) -> None:
     host, port = http_exchange_server
-    with HttpExchangeFactory(
-        host,
-        port,
-        {'Authorization': 'fake auth'},
-    ).bind_as_client() as exchange:
-        assert isinstance(exchange, HttpExchangeClient)
-        assert 'Authorization' in exchange._session.headers
+    headers = {'Authorization': 'fake auth'}
+    factory = HttpExchangeFactory(host, port, headers)
+    with factory._create_transport() as transport:
+        assert isinstance(transport, HttpExchangeTransport)
+        assert 'Authorization' in transport._session.headers
 
 
 def test_spawn_http_exchange() -> None:
@@ -147,6 +53,6 @@ def test_spawn_http_exchange() -> None:
         open_port(),
         level=logging.ERROR,
         timeout=TEST_CONNECTION_TIMEOUT,
-    ) as unbound:
-        with unbound.bind_as_client() as exchange:
-            assert isinstance(exchange, ExchangeClient)
+    ) as factory:
+        with factory._create_transport() as transport:
+            assert isinstance(transport, HttpExchangeTransport)

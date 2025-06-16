@@ -48,6 +48,7 @@ from pydantic import ValidationError
 from academy.behavior import Behavior
 from academy.exception import BadEntityIdError
 from academy.exception import MailboxClosedError
+from academy.exchange import MailboxStatus
 from academy.exchange.cloud.authenticate import Authenticator
 from academy.exchange.cloud.authenticate import get_authenticator
 from academy.exchange.cloud.config import ExchangeAuthConfig
@@ -70,6 +71,7 @@ _BAD_REQUEST_CODE = 400
 _UNAUTHORIZED_CODE = 401
 _FORBIDDEN_CODE = 403
 _NOT_FOUND_CODE = 404
+_TIMEOUT_CODE = 408
 
 
 class _MailboxManager:
@@ -85,13 +87,21 @@ class _MailboxManager:
     ) -> bool:
         return entity not in self._owners or self._owners[entity] == client
 
-    def check_mailbox(self, client: str | None, uid: EntityId) -> bool:
-        if not self.has_permissions(client, uid):
+    def check_mailbox(
+        self,
+        client: str | None,
+        uid: EntityId,
+    ) -> MailboxStatus:
+        if uid not in self._mailboxes:
+            return MailboxStatus.MISSING
+        elif not self.has_permissions(client, uid):
             raise ForbiddenError(
                 'Client does not have correct permissions.',
             )
-
-        return uid in self._mailboxes
+        elif self._mailboxes[uid].closed():
+            return MailboxStatus.TERMINATED
+        else:
+            return MailboxStatus.ACTIVE
 
     def create_mailbox(
         self,
@@ -140,14 +150,20 @@ class _MailboxManager:
                 found.append(aid)
         return found
 
-    async def get(self, client: str | None, uid: EntityId) -> Message:
+    async def get(
+        self,
+        client: str | None,
+        uid: EntityId,
+        *,
+        timeout: float | None = None,
+    ) -> Message:
         if not self.has_permissions(client, uid):
             raise ForbiddenError(
                 'Client does not have correct permissions.',
             )
 
         try:
-            return await self._mailboxes[uid].get()
+            return await self._mailboxes[uid].get(timeout=timeout)
         except KeyError as e:
             raise BadEntityIdError(uid) from e
         except QueueClosedError as e:
@@ -268,13 +284,13 @@ async def _check_mailbox_route(request: Request) -> Response:
 
     client_id = request.headers.get('client_id', None)
     try:
-        exists = manager.check_mailbox(client_id, mailbox_id)
+        status = manager.check_mailbox(client_id, mailbox_id)
     except ForbiddenError:
         return Response(
             status=_FORBIDDEN_CODE,
             text='Incorrect permissions',
         )
-    return json_response({'exists': exists})
+    return json_response({'status': status.value})
 
 
 async def _send_message_route(request: Request) -> Response:
@@ -321,9 +337,11 @@ async def _recv_message_route(request: Request) -> Response:
             text='Missing or invalid mailbox ID',
         )
 
+    timeout = data.get('timeout', None)
+
     try:
         client_id = request.headers.get('client_id', None)
-        message = await manager.get(client_id, mailbox_id)
+        message = await manager.get(client_id, mailbox_id, timeout=timeout)
     except BadEntityIdError:
         return Response(status=_NOT_FOUND_CODE, text='Unknown mailbox ID')
     except MailboxClosedError:
@@ -333,6 +351,8 @@ async def _recv_message_route(request: Request) -> Response:
             status=_FORBIDDEN_CODE,
             text='Incorrect permissions',
         )
+    except TimeoutError:
+        return Response(status=_TIMEOUT_CODE, text='Request timeout')
     else:
         return json_response({'message': message.model_dump_json()})
 

@@ -6,9 +6,12 @@ from collections.abc import Generator
 
 import pytest
 
-from academy.exchange import ExchangeClient
+from academy.exchange import UserExchangeClient
+from academy.exchange.cloud.client import HttpExchangeFactory
 from academy.exchange.cloud.server import create_app
 from academy.exchange.cloud.server import serve_app
+from academy.exchange.hybrid import HybridExchangeFactory
+from academy.exchange.redis import RedisExchangeFactory
 from academy.exchange.thread import ThreadExchangeFactory
 from academy.launcher import ThreadLauncher
 from academy.socket import open_port
@@ -16,11 +19,34 @@ from testing.constant import TEST_CONNECTION_TIMEOUT
 
 
 @pytest.fixture
-def exchange() -> Generator[ExchangeClient]:
-    with ThreadExchangeFactory().bind_as_client(
+def http_exchange_factory(
+    http_exchange_server: tuple[str, int],
+) -> HttpExchangeFactory:
+    host, port = http_exchange_server
+    return HttpExchangeFactory(host, port)
+
+
+@pytest.fixture
+def hybrid_exchange_factory(mock_redis) -> HybridExchangeFactory:
+    return HybridExchangeFactory(redis_host='localhost', redis_port=0)
+
+
+@pytest.fixture
+def redis_exchange_factory(mock_redis) -> RedisExchangeFactory:
+    return RedisExchangeFactory(hostname='localhost', port=0)
+
+
+@pytest.fixture
+def thread_exchange_factory() -> ThreadExchangeFactory:
+    return ThreadExchangeFactory()
+
+
+@pytest.fixture
+def exchange() -> Generator[UserExchangeClient]:
+    with ThreadExchangeFactory().create_user_client(
         start_listener=False,
-    ) as exchange:
-        yield exchange
+    ) as client:
+        yield client
 
 
 @pytest.fixture
