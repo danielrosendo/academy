@@ -48,7 +48,13 @@ class _MailboxState(enum.Enum):
     INACTIVE = 'INACTIVE'
 
 
-class RedisExchangeFactory(ExchangeFactory):
+class RedisAgentRegistration:
+    """Agent registration for RedisExchange."""
+
+    pass
+
+
+class RedisExchangeFactory(ExchangeFactory[RedisAgentRegistration]):
     """Redis exchange client factory.
 
     Args:
@@ -71,6 +77,7 @@ class RedisExchangeFactory(ExchangeFactory):
         mailbox_id: EntityId | None = None,
         *,
         name: str | None = None,
+        registration: RedisAgentRegistration | None = None,
     ) -> RedisExchangeTransport:
         return RedisExchangeTransport.new(
             mailbox_id=mailbox_id,
@@ -79,7 +86,10 @@ class RedisExchangeFactory(ExchangeFactory):
         )
 
 
-class RedisExchangeTransport(ExchangeTransport, NoPickleMixin):
+class RedisExchangeTransport(
+    ExchangeTransport[RedisAgentRegistration],
+    NoPickleMixin,
+):
     """Redis exchange transport bound to a specific mailbox."""
 
     def __init__(
@@ -220,7 +230,7 @@ class RedisExchangeTransport(ExchangeTransport, NoPickleMixin):
         *,
         name: str | None = None,
         _agent_id: AgentId[BehaviorT] | None = None,
-    ) -> AgentId[BehaviorT]:
+    ) -> tuple[AgentId[BehaviorT], RedisAgentRegistration]:
         aid: AgentId[BehaviorT] = (
             AgentId.new(name=name) if _agent_id is None else _agent_id
         )
@@ -229,7 +239,7 @@ class RedisExchangeTransport(ExchangeTransport, NoPickleMixin):
             self._behavior_key(aid),
             ','.join(behavior.behavior_mro()),
         )
-        return aid
+        return (aid, RedisAgentRegistration())
 
     def send(self, message: Message) -> None:
         status = self._client.get(self._active_key(message.dest))

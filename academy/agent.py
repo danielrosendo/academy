@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar('T')
 BehaviorT = TypeVar('BehaviorT', bound=Behavior)
+AgentRegistrationT = TypeVar('AgentRegistrationT')
 
 
 class _AgentState(enum.Enum):
@@ -69,13 +70,15 @@ class AgentRunConfig:
 def _agent_trampoline(
     behavior: BehaviorT,
     agent_id: AgentId[BehaviorT],
-    exchange: ExchangeFactory,
+    agent_info: AgentRegistrationT,
+    exchange: ExchangeFactory[AgentRegistrationT],
     config: AgentRunConfig,
 ) -> Agent[BehaviorT]:
     return Agent(
         behavior,
         agent_id=agent_id,
         exchange=exchange,
+        agent_info=agent_info,
         config=config,
     )
 
@@ -97,7 +100,8 @@ class Agent(Generic[BehaviorT]):
 
     Args:
         behavior: Behavior that the agent will exhibit.
-        agent_id: EntityId of this agent in a multi-agent system.
+        agent_id: Unique ID of this agent in a multi-agent system.
+        agent_info: Registration info for this agent returned by the exchange.
         exchange: Message exchange of multi-agent system. The agent will close
             the exchange when it finished running.
         config: Agent execution parameters.
@@ -108,13 +112,16 @@ class Agent(Generic[BehaviorT]):
         behavior: BehaviorT,
         *,
         agent_id: AgentId[BehaviorT],
-        exchange: ExchangeFactory,
+        agent_info: AgentRegistrationT,
+        exchange: ExchangeFactory[AgentRegistrationT],
         config: AgentRunConfig | None = None,
     ) -> None:
         self.agent_id = agent_id
+        self.agent_info = agent_info
         self.behavior = behavior
         self.exchange = exchange.create_agent_client(
             agent_id,
+            agent_info,
             request_handler=self._request_handler,
         )
         self.config = config if config is not None else AgentRunConfig()
@@ -152,8 +159,10 @@ class Agent(Generic[BehaviorT]):
         return (
             _agent_trampoline,
             (
+                # The order of these must match the __init__ params!
                 self.behavior,
                 self.agent_id,
+                self.agent_info,
                 self.exchange.factory(),
                 self.config,
             ),

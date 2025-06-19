@@ -59,7 +59,7 @@ def test_wait_bad_identifier(exchange: ThreadExchangeFactory) -> None:
         exchange=ThreadExchangeFactory(),
         launcher=ThreadLauncher(),
     ) as manager:
-        agent_id = manager.exchange.register_agent(EmptyBehavior)
+        agent_id, agent_info = manager.exchange.register_agent(EmptyBehavior)
 
         with pytest.raises(BadEntityIdError):
             manager.wait(agent_id)
@@ -84,7 +84,7 @@ def test_shutdown_bad_identifier(
         exchange=ThreadExchangeFactory(),
         launcher=ThreadLauncher(),
     ) as manager:
-        agent_id = manager.exchange.register_agent(EmptyBehavior)
+        agent_id, agent_info = manager.exchange.register_agent(EmptyBehavior)
 
         with pytest.raises(BadEntityIdError):
             manager.shutdown(agent_id)

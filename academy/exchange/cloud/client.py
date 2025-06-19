@@ -51,7 +51,13 @@ class _HttpConnectionInfo(NamedTuple):
     ssl_verify: str | bool | None = None
 
 
-class HttpExchangeFactory(ExchangeFactory):
+class HttpAgentRegistration:
+    """Agent registration for HttpExchange."""
+
+    pass
+
+
+class HttpExchangeFactory(ExchangeFactory[HttpAgentRegistration]):
     """Http exchange client factory.
 
     Args:
@@ -86,6 +92,7 @@ class HttpExchangeFactory(ExchangeFactory):
         mailbox_id: EntityId | None = None,
         *,
         name: str | None = None,
+        registration: HttpAgentRegistration | None = None,
     ) -> HttpExchangeTransport:
         return HttpExchangeTransport.new(
             connection_info=self._info,
@@ -94,7 +101,10 @@ class HttpExchangeFactory(ExchangeFactory):
         )
 
 
-class HttpExchangeTransport(ExchangeTransport, NoPickleMixin):
+class HttpExchangeTransport(
+    ExchangeTransport[HttpAgentRegistration],
+    NoPickleMixin,
+):
     """Http exchange client.
 
     Args:
@@ -234,7 +244,7 @@ class HttpExchangeTransport(ExchangeTransport, NoPickleMixin):
         *,
         name: str | None = None,
         _agent_id: AgentId[BehaviorT] | None = None,
-    ) -> AgentId[BehaviorT]:
+    ) -> tuple[AgentId[BehaviorT], HttpAgentRegistration]:
         """Create a new agent identifier and associated mailbox.
 
         Args:
@@ -254,7 +264,7 @@ class HttpExchangeTransport(ExchangeTransport, NoPickleMixin):
             },
         )
         response.raise_for_status()
-        return aid
+        return (aid, HttpAgentRegistration())
 
     def send(self, message: Message) -> None:
         response = self._session.put(

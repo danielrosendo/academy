@@ -43,7 +43,16 @@ class _ThreadExchangeState(NoPickleMixin):
         self.behaviors: dict[AgentId[Any], type[Behavior]] = {}
 
 
-class ThreadExchangeFactory(ExchangeFactory, NoPickleMixin):
+class ThreadAgentRegistration:
+    """Agent registration for ThreadExchange."""
+
+    pass
+
+
+class ThreadExchangeFactory(
+    ExchangeFactory[ThreadAgentRegistration],
+    NoPickleMixin,
+):
     """Local exchange client factory.
 
     A thread exchange can be used to pass messages between agents running
@@ -62,6 +71,7 @@ class ThreadExchangeFactory(ExchangeFactory, NoPickleMixin):
         mailbox_id: EntityId | None = None,
         *,
         name: str | None = None,
+        registration: ThreadAgentRegistration | None = None,
     ) -> ThreadExchangeTransport:
         return ThreadExchangeTransport.new(
             mailbox_id,
@@ -70,7 +80,10 @@ class ThreadExchangeFactory(ExchangeFactory, NoPickleMixin):
         )
 
 
-class ThreadExchangeTransport(ExchangeTransport, NoPickleMixin):
+class ThreadExchangeTransport(
+    ExchangeTransport[ThreadAgentRegistration],
+    NoPickleMixin,
+):
     """Thread exchange client bound to a specific mailbox."""
 
     def __init__(
@@ -147,13 +160,13 @@ class ThreadExchangeTransport(ExchangeTransport, NoPickleMixin):
         *,
         name: str | None = None,
         _agent_id: AgentId[BehaviorT] | None = None,
-    ) -> AgentId[BehaviorT]:
+    ) -> tuple[AgentId[BehaviorT], ThreadAgentRegistration]:
         aid: AgentId[BehaviorT] = (
             AgentId.new(name=name) if _agent_id is None else _agent_id
         )
         self._state.queues[aid] = Queue()
         self._state.behaviors[aid] = behavior
-        return aid
+        return (aid, ThreadAgentRegistration())
 
     def send(self, message: Message) -> None:
         queue = self._state.queues.get(message.dest, None)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pickle
 from concurrent.futures import Future
+from typing import Any
 
 import pytest
 
@@ -84,9 +85,9 @@ def test_proxy_handle_agent_shutdown_errors() -> None:
 
 
 def test_unbound_remote_handle_serialize(
-    exchange: UserExchangeClient,
+    exchange: UserExchangeClient[Any],
 ) -> None:
-    agent_id = exchange.register_agent(EmptyBehavior)
+    agent_id, agent_info = exchange.register_agent(EmptyBehavior)
     handle = UnboundRemoteHandle(agent_id)
     assert isinstance(handle, Handle)
 
@@ -97,15 +98,17 @@ def test_unbound_remote_handle_serialize(
     assert repr(reconstructed) == repr(handle)
 
 
-def test_unbound_remote_handle_bind(exchange: UserExchangeClient) -> None:
-    agent_id = exchange.register_agent(EmptyBehavior)
+def test_unbound_remote_handle_bind(exchange: UserExchangeClient[Any]) -> None:
+    agent_id, agent_info = exchange.register_agent(EmptyBehavior)
     handle = UnboundRemoteHandle(agent_id)
     with handle.bind_to_exchange(exchange) as agent_bound:
         assert isinstance(agent_bound, BoundRemoteHandle)
 
 
-def test_unbound_remote_handle_errors(exchange: UserExchangeClient) -> None:
-    agent_id = exchange.register_agent(EmptyBehavior)
+def test_unbound_remote_handle_errors(
+    exchange: UserExchangeClient[Any],
+) -> None:
+    agent_id, agent_info = exchange.register_agent(EmptyBehavior)
     handle = UnboundRemoteHandle(agent_id)
     request = PingRequest(src=exchange.user_id, dest=agent_id)
     with pytest.raises(HandleNotBoundError):
@@ -120,8 +123,8 @@ def test_unbound_remote_handle_errors(exchange: UserExchangeClient) -> None:
         handle.shutdown()
 
 
-def test_remote_handle_closed_error(exchange: UserExchangeClient) -> None:
-    agent_id = exchange.register_agent(EmptyBehavior)
+def test_remote_handle_closed_error(exchange: UserExchangeClient[Any]) -> None:
+    agent_id, agent_info = exchange.register_agent(EmptyBehavior)
     handle = BoundRemoteHandle(
         exchange,
         agent_id,
@@ -138,8 +141,10 @@ def test_remote_handle_closed_error(exchange: UserExchangeClient) -> None:
         handle.shutdown()
 
 
-def test_agent_remote_handle_serialize(exchange: UserExchangeClient) -> None:
-    agent_id = exchange.register_agent(EmptyBehavior)
+def test_agent_remote_handle_serialize(
+    exchange: UserExchangeClient[Any],
+) -> None:
+    agent_id, agent_info = exchange.register_agent(EmptyBehavior)
     with BoundRemoteHandle(exchange, agent_id, exchange.user_id) as handle:
         # Note: don't call pickle.dumps here because ThreadExchange
         # is not pickleable so we test __reduce__ directly.
@@ -151,10 +156,11 @@ def test_agent_remote_handle_serialize(exchange: UserExchangeClient) -> None:
         assert reconstructed.agent_id == handle.agent_id
 
 
-def test_agent_remote_handle_bind(exchange: UserExchangeClient) -> None:
-    agent_id = exchange.register_agent(EmptyBehavior)
+def test_agent_remote_handle_bind(exchange: UserExchangeClient[Any]) -> None:
+    agent_id, agent_info = exchange.register_agent(EmptyBehavior)
     with exchange.factory().create_agent_client(
         agent_id=agent_id,
+        agent_info=agent_info,
         request_handler=lambda _: None,
     ) as client:
         with pytest.raises(

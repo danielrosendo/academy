@@ -30,6 +30,7 @@ from academy.identifier import AgentId
 logger = logging.getLogger(__name__)
 
 BehaviorT = TypeVar('BehaviorT', bound=Behavior)
+AgentRegistrationT = TypeVar('AgentRegistrationT')
 
 
 def _run_agent_on_worker(agent: Agent[Any]) -> None:
@@ -41,11 +42,12 @@ def _run_agent_on_worker(agent: Agent[Any]) -> None:
 
 
 @dataclasses.dataclass
-class _ACB(Generic[BehaviorT]):
+class _ACB(Generic[BehaviorT, AgentRegistrationT]):
     # Agent Control Block
     agent_id: AgentId[BehaviorT]
+    agent_info: AgentRegistrationT
     behavior: BehaviorT
-    exchange: ExchangeFactory
+    exchange: ExchangeFactory[AgentRegistrationT]
     done: threading.Event
     future: Future[None] | None = None
     launch_count: int = 0
@@ -76,8 +78,8 @@ class Launcher:
         self._executor = executor
         self._close_exchange = close_exchange
         self._max_restarts = max_restarts
-        self._acbs: dict[AgentId[Any], _ACB[Any]] = {}
-        self._future_to_acb: dict[Future[None], _ACB[Any]] = {}
+        self._acbs: dict[AgentId[Any], _ACB[Any, Any]] = {}
+        self._future_to_acb: dict[Future[None], _ACB[Any, Any]] = {}
 
     def __enter__(self) -> Self:
         return self
@@ -137,6 +139,7 @@ class Launcher:
         agent = Agent(
             acb.behavior,
             agent_id=acb.agent_id,
+            agent_info=acb.agent_info,
             exchange=acb.exchange,
             config=AgentRunConfig(
                 terminate_on_error=acb.launch_count + 1 >= self._max_restarts,
@@ -149,11 +152,7 @@ class Launcher:
         future.add_done_callback(self._callback)
 
         if acb.launch_count == 1:
-            logger.debug(
-                'Launched agent (%s; %s)',
-                acb.agent_id,
-                acb.behavior,
-            )
+            logger.debug('Launched agent (%s; %s)', acb.agent_id, acb.behavior)
         else:
             restarts = acb.launch_count - 1
             logger.debug(
@@ -167,7 +166,7 @@ class Launcher:
     def launch(
         self,
         behavior: BehaviorT,
-        exchange: ExchangeClient,
+        exchange: ExchangeClient[AgentRegistrationT],
         *,
         agent_id: AgentId[BehaviorT] | None = None,
         name: str | None = None,
@@ -185,14 +184,15 @@ class Launcher:
         Returns:
             Handle (unbound) used to interact with the agent.
         """
-        agent_id = (
-            exchange.register_agent(type(behavior), name=name)
-            if agent_id is None
-            else agent_id
+        agent_id, agent_info = exchange.register_agent(
+            type(behavior),
+            name=name,
+            _agent_id=agent_id,
         )
 
         acb = _ACB(
             agent_id,
+            agent_info,
             behavior,
             exchange.factory(),
             done=threading.Event(),

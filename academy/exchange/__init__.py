@@ -41,6 +41,7 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 BehaviorT = TypeVar('BehaviorT', bound=Behavior)
+AgentRegistrationT = TypeVar('AgentRegistrationT')
 
 
 class MailboxStatus(enum.Enum):
@@ -54,7 +55,7 @@ class MailboxStatus(enum.Enum):
     """Mailbox was terminated and no longer accepts messages."""
 
 
-class ExchangeFactory(abc.ABC):
+class ExchangeFactory(abc.ABC, Generic[AgentRegistrationT]):
     """Exchange client factory.
 
     An exchange factory is used to mint new exchange clients for users and
@@ -74,13 +75,15 @@ class ExchangeFactory(abc.ABC):
         mailbox_id: EntityId | None = None,
         *,
         name: str | None = None,
-    ) -> ExchangeTransport: ...
+        registration: AgentRegistrationT | None = None,
+    ) -> ExchangeTransport[AgentRegistrationT]: ...
 
     def create_agent_client(
         self,
         agent_id: AgentId[BehaviorT],
+        agent_info: AgentRegistrationT,
         request_handler: Callable[[RequestMessage], None],
-    ) -> AgentExchangeClient[BehaviorT]:
+    ) -> AgentExchangeClient[AgentRegistrationT, BehaviorT]:
         """Create a new agent exchange client.
 
         An agent must be registered with the exchange before an exchange
@@ -88,19 +91,24 @@ class ExchangeFactory(abc.ABC):
         ```python
         factory = ExchangeFactory(...)
         user_client = factory.create_user_client()
-        agent_id = user_client.register_agent(...)
-        agent_client = factory.create_agent_client(agent_id, ...)
+        agent_id, agent_info = user_client.register_agent(...)
+        agent_client = factory.create_agent_client(agent_id, agent_info, ...)
         ```
 
         Args:
             agent_id: ID of the agent to create a client for.
+            agent_info: Registration information created by the exchange
+                for this agent.
             request_handler: Agent request message handler.
 
         Raises:
             BadEntityIdError: If an agent with `agent_id` is not already
                 registered with the exchange.
         """
-        transport = self._create_transport(mailbox_id=agent_id)
+        transport = self._create_transport(
+            mailbox_id=agent_id,
+            registration=agent_info,
+        )
         assert transport.mailbox_id == agent_id
         if transport.status(agent_id) != MailboxStatus.ACTIVE:
             transport.close()
@@ -116,7 +124,7 @@ class ExchangeFactory(abc.ABC):
         *,
         name: str | None = None,
         start_listener: bool = True,
-    ) -> UserExchangeClient:
+    ) -> UserExchangeClient[AgentRegistrationT]:
         """Create a new user in the exchange and associated client.
 
         Args:
@@ -133,7 +141,7 @@ class ExchangeFactory(abc.ABC):
         )
 
 
-class ExchangeTransport(abc.ABC):
+class ExchangeTransport(abc.ABC, Generic[AgentRegistrationT]):
     """Low-level exchange communicator.
 
     A message exchange hosts mailboxes for each entity (i.e., agent or
@@ -205,7 +213,7 @@ class ExchangeTransport(abc.ABC):
         ...
 
     @abc.abstractmethod
-    def factory(self) -> ExchangeFactory:
+    def factory(self) -> ExchangeFactory[AgentRegistrationT]:
         """Get an exchange factory."""
         ...
 
@@ -237,7 +245,7 @@ class ExchangeTransport(abc.ABC):
         # close an agent mailbox and immediately re-register it. This will no
         # longer be needed after Issue #100 and can be removed.
         _agent_id: AgentId[BehaviorT] | None = None,
-    ) -> AgentId[BehaviorT]:
+    ) -> tuple[AgentId[BehaviorT], AgentRegistrationT]:
         """Register a new agent and associated mailbox with the exchange.
 
         Args:
@@ -245,7 +253,7 @@ class ExchangeTransport(abc.ABC):
             name: Optional display name for the agent.
 
         Returns:
-            Agent ID.
+            Agent ID and registration info.
         """
         ...
 
@@ -287,7 +295,7 @@ class ExchangeTransport(abc.ABC):
         ...
 
 
-class ExchangeClient(abc.ABC):
+class ExchangeClient(abc.ABC, Generic[AgentRegistrationT]):
     """Base exchange client.
 
     Warning:
@@ -301,7 +309,10 @@ class ExchangeClient(abc.ABC):
         transport: Exchange transport bound to a mailbox.
     """
 
-    def __init__(self, transport: ExchangeTransport) -> None:
+    def __init__(
+        self,
+        transport: ExchangeTransport[AgentRegistrationT],
+    ) -> None:
         self._transport = transport
         self._handles: dict[uuid.UUID, BoundRemoteHandle[Any]] = {}
 
@@ -348,7 +359,7 @@ class ExchangeClient(abc.ABC):
             allow_subclasses=allow_subclasses,
         )
 
-    def factory(self) -> ExchangeFactory:
+    def factory(self) -> ExchangeFactory[AgentRegistrationT]:
         """Get an exchange factory."""
         return self._transport.factory()
 
@@ -388,7 +399,7 @@ class ExchangeClient(abc.ABC):
         *,
         name: str | None = None,
         _agent_id: AgentId[BehaviorT] | None = None,
-    ) -> AgentId[BehaviorT]:
+    ) -> tuple[AgentId[BehaviorT], AgentRegistrationT]:
         """Register a new agent and associated mailbox with the exchange.
 
         Args:
@@ -396,15 +407,15 @@ class ExchangeClient(abc.ABC):
             name: Optional display name for the agent.
 
         Returns:
-            Agent ID.
+            Agent ID and registration info.
         """
-        agent_id = self._transport.register_agent(
+        agent_id, agent_info = self._transport.register_agent(
             behavior,
             name=name,
             _agent_id=_agent_id,
         )
         logger.info('Registered %s in exchange', agent_id)
-        return agent_id
+        return (agent_id, agent_info)
 
     def send(self, message: Message) -> None:
         """Send a message to a mailbox.
@@ -460,7 +471,10 @@ class ExchangeClient(abc.ABC):
     def _handle_message(self, message: Message) -> None: ...
 
 
-class AgentExchangeClient(ExchangeClient, Generic[BehaviorT]):
+class AgentExchangeClient(
+    ExchangeClient[AgentRegistrationT],
+    Generic[AgentRegistrationT, BehaviorT],
+):
     """Agent exchange client.
 
     Warning:
@@ -478,7 +492,7 @@ class AgentExchangeClient(ExchangeClient, Generic[BehaviorT]):
     def __init__(
         self,
         agent_id: AgentId[BehaviorT],
-        transport: ExchangeTransport,
+        transport: ExchangeTransport[AgentRegistrationT],
         request_handler: Callable[[RequestMessage], None],
     ) -> None:
         super().__init__(transport)
@@ -526,7 +540,7 @@ class AgentExchangeClient(ExchangeClient, Generic[BehaviorT]):
             raise AssertionError('Unreachable.')
 
 
-class UserExchangeClient(ExchangeClient):
+class UserExchangeClient(ExchangeClient[AgentRegistrationT]):
     """User exchange client.
 
     Warning:
@@ -542,7 +556,7 @@ class UserExchangeClient(ExchangeClient):
     def __init__(
         self,
         user_id: UserId,
-        transport: ExchangeTransport,
+        transport: ExchangeTransport[AgentRegistrationT],
         *,
         start_listener: bool = True,
     ) -> None:

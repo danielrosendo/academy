@@ -51,7 +51,13 @@ _SERVER_ACK = b'<ACK>'
 _SOCKET_POLL_TIMEOUT_MS = 50
 
 
-class HybridExchangeFactory(ExchangeFactory):
+class HybridAgentRegistration:
+    """Agent registration for HybridExchange."""
+
+    pass
+
+
+class HybridExchangeFactory(ExchangeFactory[HybridAgentRegistration]):
     """Hybrid exchange client factory.
 
     The hybrid exchange uses peer-to-peer communication via TCP and a
@@ -101,6 +107,7 @@ class HybridExchangeFactory(ExchangeFactory):
         mailbox_id: EntityId | None = None,
         *,
         name: str | None = None,
+        registration: HybridAgentRegistration | None = None,
     ) -> HybridExchangeTransport:
         return HybridExchangeTransport.new(
             interface=self._interface,
@@ -112,7 +119,10 @@ class HybridExchangeFactory(ExchangeFactory):
         )
 
 
-class HybridExchangeTransport(ExchangeTransport, NoPickleMixin):
+class HybridExchangeTransport(
+    ExchangeTransport[HybridAgentRegistration],
+    NoPickleMixin,
+):
     """Hybrid exchange transport bound to a specific mailbox."""
 
     def __init__(  # noqa: PLR0913
@@ -266,7 +276,7 @@ class HybridExchangeTransport(ExchangeTransport, NoPickleMixin):
         *,
         name: str | None = None,
         _agent_id: AgentId[BehaviorT] | None = None,
-    ) -> AgentId[BehaviorT]:
+    ) -> tuple[AgentId[BehaviorT], HybridAgentRegistration]:
         aid: AgentId[Any] = (
             AgentId.new(name=name) if _agent_id is None else _agent_id
         )
@@ -278,7 +288,7 @@ class HybridExchangeTransport(ExchangeTransport, NoPickleMixin):
             self._behavior_key(aid),
             ','.join(behavior.behavior_mro()),
         )
-        return aid
+        return (aid, HybridAgentRegistration())
 
     def _send_direct(self, address: str, message: Message) -> None:
         self._socket_pool.send(address, message.model_serialize())
