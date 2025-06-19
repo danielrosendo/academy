@@ -1,14 +1,15 @@
 # ruff: noqa: D102
 from __future__ import annotations
 
+import dataclasses
 import enum
 import logging
 import sys
 import uuid
 from typing import Any
+from typing import Generic
 from typing import get_args
 from typing import NamedTuple
-from typing import TypeVar
 
 if sys.version_info >= (3, 11):  # pragma: >=3.11 cover
     from typing import Self
@@ -18,11 +19,12 @@ else:  # pragma: <3.11 cover
 import redis
 
 from academy.behavior import Behavior
+from academy.behavior import BehaviorT
 from academy.exception import BadEntityIdError
 from academy.exception import MailboxClosedError
 from academy.exchange import ExchangeFactory
-from academy.exchange import ExchangeTransport
-from academy.exchange import MailboxStatus
+from academy.exchange.transport import ExchangeTransportMixin
+from academy.exchange.transport import MailboxStatus
 from academy.identifier import AgentId
 from academy.identifier import EntityId
 from academy.identifier import UserId
@@ -31,8 +33,6 @@ from academy.message import Message
 from academy.serialize import NoPickleMixin
 
 logger = logging.getLogger(__name__)
-
-BehaviorT = TypeVar('BehaviorT', bound=Behavior)
 
 _CLOSE_SENTINEL = b'<CLOSED>'
 
@@ -48,48 +48,15 @@ class _MailboxState(enum.Enum):
     INACTIVE = 'INACTIVE'
 
 
-class RedisAgentRegistration:
-    """Agent registration for RedisExchange."""
+@dataclasses.dataclass
+class RedisAgentRegistration(Generic[BehaviorT]):
+    """Agent registration for redis exchanges."""
 
-    pass
-
-
-class RedisExchangeFactory(ExchangeFactory[RedisAgentRegistration]):
-    """Redis exchange client factory.
-
-    Args:
-        hostname: Redis server hostname.
-        port: Redis server port.
-        redis_kwargs: Extra keyword arguments to pass to
-            [`redis.Redis()`][redis.Redis].
-    """
-
-    def __init__(
-        self,
-        hostname: str,
-        port: int,
-        **redis_kwargs: Any,
-    ) -> None:
-        self.redis_info = _RedisConnectionInfo(hostname, port, redis_kwargs)
-
-    def _create_transport(
-        self,
-        mailbox_id: EntityId | None = None,
-        *,
-        name: str | None = None,
-        registration: RedisAgentRegistration | None = None,
-    ) -> RedisExchangeTransport:
-        return RedisExchangeTransport.new(
-            mailbox_id=mailbox_id,
-            name=name,
-            redis_info=self.redis_info,
-        )
+    agent_id: AgentId[BehaviorT]
+    """Unique identifier for the agent created by the exchange."""
 
 
-class RedisExchangeTransport(
-    ExchangeTransport[RedisAgentRegistration],
-    NoPickleMixin,
-):
+class RedisExchangeTransport(ExchangeTransportMixin, NoPickleMixin):
     """Redis exchange transport bound to a specific mailbox."""
 
     def __init__(
@@ -230,7 +197,7 @@ class RedisExchangeTransport(
         *,
         name: str | None = None,
         _agent_id: AgentId[BehaviorT] | None = None,
-    ) -> tuple[AgentId[BehaviorT], RedisAgentRegistration]:
+    ) -> RedisAgentRegistration[BehaviorT]:
         aid: AgentId[BehaviorT] = (
             AgentId.new(name=name) if _agent_id is None else _agent_id
         )
@@ -239,7 +206,7 @@ class RedisExchangeTransport(
             self._behavior_key(aid),
             ','.join(behavior.behavior_mro()),
         )
-        return (aid, RedisAgentRegistration())
+        return RedisAgentRegistration(agent_id=aid)
 
     def send(self, message: Message) -> None:
         status = self._client.get(self._active_key(message.dest))
@@ -270,3 +237,35 @@ class RedisExchangeTransport(
         self._client.rpush(self._queue_key(uid), _CLOSE_SENTINEL)
         if isinstance(uid, AgentId):
             self._client.delete(self._behavior_key(uid))
+
+
+class RedisExchangeFactory(ExchangeFactory[RedisExchangeTransport]):
+    """Redis exchange client factory.
+
+    Args:
+        hostname: Redis server hostname.
+        port: Redis server port.
+        redis_kwargs: Extra keyword arguments to pass to
+            [`redis.Redis()`][redis.Redis].
+    """
+
+    def __init__(
+        self,
+        hostname: str,
+        port: int,
+        **redis_kwargs: Any,
+    ) -> None:
+        self.redis_info = _RedisConnectionInfo(hostname, port, redis_kwargs)
+
+    def _create_transport(
+        self,
+        mailbox_id: EntityId | None = None,
+        *,
+        name: str | None = None,
+        registration: RedisAgentRegistration[Any] | None = None,  # type: ignore[override]
+    ) -> RedisExchangeTransport:
+        return RedisExchangeTransport.new(
+            mailbox_id=mailbox_id,
+            name=name,
+            redis_info=self.redis_info,
+        )

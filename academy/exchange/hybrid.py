@@ -2,14 +2,15 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
 import logging
 import sys
 import threading
 import uuid
 from collections.abc import Iterable
 from typing import Any
+from typing import Generic
 from typing import get_args
-from typing import TypeVar
 
 if sys.version_info >= (3, 11):  # pragma: >=3.11 cover
     from typing import Self
@@ -19,15 +20,16 @@ else:  # pragma: <3.11 cover
 import redis
 
 from academy.behavior import Behavior
+from academy.behavior import BehaviorT
 from academy.exception import BadEntityIdError
 from academy.exception import MailboxClosedError
 from academy.exchange import ExchangeFactory
-from academy.exchange import ExchangeTransport
-from academy.exchange import MailboxStatus
 from academy.exchange.queue import Queue
 from academy.exchange.queue import QueueClosedError
 from academy.exchange.redis import _MailboxState
 from academy.exchange.redis import _RedisConnectionInfo
+from academy.exchange.transport import ExchangeTransportMixin
+from academy.exchange.transport import MailboxStatus
 from academy.identifier import AgentId
 from academy.identifier import EntityId
 from academy.identifier import UserId
@@ -42,8 +44,6 @@ from academy.socket import SocketClosedError
 
 logger = logging.getLogger(__name__)
 
-BehaviorT = TypeVar('BehaviorT', bound=Behavior)
-
 _CLOSE_SENTINEL = b'<CLOSED>'
 _THREAD_START_TIMEOUT = 5
 _THREAD_JOIN_TIMEOUT = 5
@@ -51,78 +51,15 @@ _SERVER_ACK = b'<ACK>'
 _SOCKET_POLL_TIMEOUT_MS = 50
 
 
-class HybridAgentRegistration:
-    """Agent registration for HybridExchange."""
+@dataclasses.dataclass
+class HybridAgentRegistration(Generic[BehaviorT]):
+    """Agent registration for hybrid exchanges."""
 
-    pass
-
-
-class HybridExchangeFactory(ExchangeFactory[HybridAgentRegistration]):
-    """Hybrid exchange client factory.
-
-    The hybrid exchange uses peer-to-peer communication via TCP and a
-    central Redis server for mailbox state and queueing messages for
-    offline entities.
-
-    Args:
-        redis_host: Redis server hostname.
-        redis_port: Redis server port.
-        redis_kwargs: Extra keyword arguments to pass to
-            [`redis.Redis()`][redis.Redis].
-        interface: Network interface use for peer-to-peer communication. If
-            `None`, the hostname of the local host is used.
-        namespace: Redis key namespace. If `None` a random key prefix is
-            generated.
-        ports: An iterable of ports to give each client a unique port from a
-            user defined set. A StopIteration exception will be raised in
-            `create_*_client()` methods if the number of clients in the process
-            is greater than the length of the iterable.
-    """
-
-    def __init__(  # noqa: PLR0913
-        self,
-        redis_host: str,
-        redis_port: int,
-        *,
-        redis_kwargs: dict[str, Any] | None = None,
-        interface: str | None = None,
-        namespace: str | None = 'default',
-        ports: Iterable[int] | None = None,
-    ) -> None:
-        self._namespace = (
-            namespace
-            if namespace is not None
-            else uuid_to_base32(uuid.uuid4())
-        )
-        self._interface = interface
-        self._redis_info = _RedisConnectionInfo(
-            redis_host,
-            redis_port,
-            redis_kwargs if redis_kwargs is not None else {},
-        )
-        self._ports = None if ports is None else iter(ports)
-
-    def _create_transport(
-        self,
-        mailbox_id: EntityId | None = None,
-        *,
-        name: str | None = None,
-        registration: HybridAgentRegistration | None = None,
-    ) -> HybridExchangeTransport:
-        return HybridExchangeTransport.new(
-            interface=self._interface,
-            mailbox_id=mailbox_id,
-            name=name,
-            namespace=self._namespace,
-            port=None if self._ports is None else next(self._ports),
-            redis_info=self._redis_info,
-        )
+    agent_id: AgentId[BehaviorT]
+    """Unique identifier for the agent created by the exchange."""
 
 
-class HybridExchangeTransport(
-    ExchangeTransport[HybridAgentRegistration],
-    NoPickleMixin,
-):
+class HybridExchangeTransport(ExchangeTransportMixin, NoPickleMixin):
     """Hybrid exchange transport bound to a specific mailbox."""
 
     def __init__(  # noqa: PLR0913
@@ -276,7 +213,7 @@ class HybridExchangeTransport(
         *,
         name: str | None = None,
         _agent_id: AgentId[BehaviorT] | None = None,
-    ) -> tuple[AgentId[BehaviorT], HybridAgentRegistration]:
+    ) -> HybridAgentRegistration[BehaviorT]:
         aid: AgentId[Any] = (
             AgentId.new(name=name) if _agent_id is None else _agent_id
         )
@@ -288,7 +225,7 @@ class HybridExchangeTransport(
             self._behavior_key(aid),
             ','.join(behavior.behavior_mro()),
         )
-        return (aid, HybridAgentRegistration())
+        return HybridAgentRegistration(agent_id=aid)
 
     def _send_direct(self, address: str, message: Message) -> None:
         self._socket_pool.send(address, message.model_serialize())
@@ -488,6 +425,68 @@ class HybridExchangeTransport(
                 'Redis watcher thread failed to exit within '
                 f'{_THREAD_JOIN_TIMEOUT} seconds.',
             )
+
+
+class HybridExchangeFactory(ExchangeFactory[HybridExchangeTransport]):
+    """Hybrid exchange client factory.
+
+    The hybrid exchange uses peer-to-peer communication via TCP and a
+    central Redis server for mailbox state and queueing messages for
+    offline entities.
+
+    Args:
+        redis_host: Redis server hostname.
+        redis_port: Redis server port.
+        redis_kwargs: Extra keyword arguments to pass to
+            [`redis.Redis()`][redis.Redis].
+        interface: Network interface use for peer-to-peer communication. If
+            `None`, the hostname of the local host is used.
+        namespace: Redis key namespace. If `None` a random key prefix is
+            generated.
+        ports: An iterable of ports to give each client a unique port from a
+            user defined set. A StopIteration exception will be raised in
+            `create_*_client()` methods if the number of clients in the process
+            is greater than the length of the iterable.
+    """
+
+    def __init__(  # noqa: PLR0913
+        self,
+        redis_host: str,
+        redis_port: int,
+        *,
+        redis_kwargs: dict[str, Any] | None = None,
+        interface: str | None = None,
+        namespace: str | None = 'default',
+        ports: Iterable[int] | None = None,
+    ) -> None:
+        self._namespace = (
+            namespace
+            if namespace is not None
+            else uuid_to_base32(uuid.uuid4())
+        )
+        self._interface = interface
+        self._redis_info = _RedisConnectionInfo(
+            redis_host,
+            redis_port,
+            redis_kwargs if redis_kwargs is not None else {},
+        )
+        self._ports = None if ports is None else iter(ports)
+
+    def _create_transport(
+        self,
+        mailbox_id: EntityId | None = None,
+        *,
+        name: str | None = None,
+        registration: HybridAgentRegistration[Any] | None = None,  # type: ignore[override]
+    ) -> HybridExchangeTransport:
+        return HybridExchangeTransport.new(
+            interface=self._interface,
+            mailbox_id=mailbox_id,
+            name=name,
+            namespace=self._namespace,
+            port=None if self._ports is None else next(self._ports),
+            redis_info=self._redis_info,
+        )
 
 
 class _SocketPool:
