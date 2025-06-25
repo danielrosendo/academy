@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import asyncio
 import pickle
-from concurrent.futures import Future
 from typing import Any
 
 import pytest
@@ -9,11 +9,10 @@ import pytest
 from academy.exception import HandleClosedError
 from academy.exception import HandleNotBoundError
 from academy.exception import MailboxClosedError
+from academy.exchange import ExchangeClient
 from academy.exchange import UserExchangeClient
-from academy.exchange.thread import ThreadExchangeFactory
-from academy.handle import BoundRemoteHandle
-from academy.handle import Handle
 from academy.handle import ProxyHandle
+from academy.handle import RemoteHandle
 from academy.handle import UnboundRemoteHandle
 from academy.launcher import ThreadLauncher
 from academy.message import PingRequest
@@ -24,72 +23,85 @@ from testing.behavior import SleepBehavior
 from testing.constant import TEST_SLEEP
 
 
-def test_proxy_handle_protocol() -> None:
+@pytest.mark.asyncio
+async def test_proxy_handle_protocol() -> None:
     behavior = EmptyBehavior()
     handle = ProxyHandle(behavior)
-    assert isinstance(handle, Handle)
     assert str(behavior) in str(handle)
     assert repr(behavior) in repr(handle)
-    assert handle.ping() >= 0
-    handle.shutdown()
+    assert await handle.ping() >= 0
+    await handle.shutdown()
 
 
-def test_proxy_handle_actions() -> None:
+@pytest.mark.asyncio
+async def test_proxy_handle_actions() -> None:
     handle = ProxyHandle(CounterBehavior())
 
     # Via Handle.action()
-    assert handle.action('add', 1).result() is None
-    assert handle.action('count').result() == 1
+    add_future: asyncio.Future[None] = await handle.action('add', 1)
+    await add_future
+    count_future: asyncio.Future[int] = await handle.action('count')
+    assert await count_future == 1
 
     # Via attribute lookup
-    assert handle.add(1).result() is None
-    assert handle.count().result() == 2  # noqa: PLR2004
+    add_future = await handle.add(1)
+    await add_future
+    count_future = await handle.count()
+    assert await count_future == 2  # noqa: PLR2004
 
 
-def test_proxy_handle_action_errors() -> None:
+@pytest.mark.asyncio
+async def test_proxy_handle_action_errors() -> None:
     handle = ProxyHandle(ErrorBehavior())
+
+    fails_future: asyncio.Future[None] = await handle.action('fails')
     with pytest.raises(RuntimeError, match='This action always fails.'):
-        handle.action('fails').result()
+        await fails_future
+
+    null_future: asyncio.Future[None] = await handle.action('null')
     with pytest.raises(AttributeError, match='null'):
-        handle.action('null').result()
+        await null_future
+
     with pytest.raises(AttributeError, match='null'):
-        handle.null()  # type: ignore[attr-defined]
+        await handle.null()  # type: ignore[attr-defined]
 
     handle.behavior.foo = 1  # type: ignore[attr-defined]
     with pytest.raises(AttributeError, match='not a method'):
-        handle.foo()  # type: ignore[attr-defined]
+        await handle.foo()  # type: ignore[attr-defined]
 
 
-def test_proxy_handle_closed_errors() -> None:
+@pytest.mark.asyncio
+async def test_proxy_handle_closed_errors() -> None:
     handle = ProxyHandle(EmptyBehavior())
-    handle.close()
+    await handle.close()
 
     with pytest.raises(HandleClosedError):
-        handle.action('test')
+        await handle.action('test')
     with pytest.raises(HandleClosedError):
-        handle.ping()
+        await handle.ping()
     with pytest.raises(HandleClosedError):
-        handle.shutdown()
+        await handle.shutdown()
 
 
-def test_proxy_handle_agent_shutdown_errors() -> None:
+@pytest.mark.asyncio
+async def test_proxy_handle_agent_shutdown_errors() -> None:
     handle = ProxyHandle(EmptyBehavior())
-    handle.shutdown()
+    await handle.shutdown()
 
     with pytest.raises(MailboxClosedError):
-        handle.action('test')
+        await handle.action('test')
     with pytest.raises(MailboxClosedError):
-        handle.ping()
+        await handle.ping()
     with pytest.raises(MailboxClosedError):
-        handle.shutdown()
+        await handle.shutdown()
 
 
-def test_unbound_remote_handle_serialize(
+@pytest.mark.asyncio
+async def test_unbound_remote_handle_serialize(
     exchange: UserExchangeClient[Any],
 ) -> None:
-    registration = exchange.register_agent(EmptyBehavior)
+    registration = await exchange.register_agent(EmptyBehavior)
     handle = UnboundRemoteHandle(registration.agent_id)
-    assert isinstance(handle, Handle)
 
     dumped = pickle.dumps(handle)
     reconstructed = pickle.loads(dumped)
@@ -98,58 +110,60 @@ def test_unbound_remote_handle_serialize(
     assert repr(reconstructed) == repr(handle)
 
 
-def test_unbound_remote_handle_bind(exchange: UserExchangeClient[Any]) -> None:
-    registration = exchange.register_agent(EmptyBehavior)
-    handle = UnboundRemoteHandle(registration.agent_id)
-    with handle.bind_to_exchange(exchange) as agent_bound:
-        assert isinstance(agent_bound, BoundRemoteHandle)
-
-
-def test_unbound_remote_handle_errors(
+@pytest.mark.asyncio
+async def test_unbound_remote_handle_bind(
     exchange: UserExchangeClient[Any],
 ) -> None:
-    registration = exchange.register_agent(EmptyBehavior)
+    registration = await exchange.register_agent(EmptyBehavior)
     handle = UnboundRemoteHandle(registration.agent_id)
-    request = PingRequest(src=exchange.user_id, dest=registration.agent_id)
-    with pytest.raises(HandleNotBoundError):
-        handle._send_request(request)
-    with pytest.raises(HandleNotBoundError):
-        handle.action('foo')
-    with pytest.raises(HandleNotBoundError):
-        handle.ping()
-    with pytest.raises(HandleNotBoundError):
-        handle.close()
-    with pytest.raises(HandleNotBoundError):
-        handle.shutdown()
+    with pytest.raises(
+        RuntimeError,
+        match='An unbound handle has no client ID.',
+    ):
+        _ = handle.client_id
+    async with await handle.bind_to_exchange(exchange) as agent_bound:
+        assert isinstance(agent_bound, RemoteHandle)
 
 
-def test_remote_handle_closed_error(exchange: UserExchangeClient[Any]) -> None:
-    registration = exchange.register_agent(EmptyBehavior)
-    handle = BoundRemoteHandle(
-        exchange,
-        registration.agent_id,
-        exchange.user_id,
-    )
-    handle.close()
-
-    assert handle.mailbox_id is not None
-    with pytest.raises(HandleClosedError):
-        handle.action('foo')
-    with pytest.raises(HandleClosedError):
-        handle.ping()
-    with pytest.raises(HandleClosedError):
-        handle.shutdown()
-
-
-def test_agent_remote_handle_serialize(
+@pytest.mark.asyncio
+async def test_unbound_remote_handle_errors(
     exchange: UserExchangeClient[Any],
 ) -> None:
-    registration = exchange.register_agent(EmptyBehavior)
-    with BoundRemoteHandle(
-        exchange,
-        registration.agent_id,
-        exchange.user_id,
-    ) as handle:
+    registration = await exchange.register_agent(EmptyBehavior)
+    handle = UnboundRemoteHandle(registration.agent_id)
+    with pytest.raises(HandleNotBoundError):
+        await handle.action('foo')
+    with pytest.raises(HandleNotBoundError):
+        await handle.ping()
+    with pytest.raises(HandleNotBoundError):
+        await handle.close()
+    with pytest.raises(HandleNotBoundError):
+        await handle.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_remote_handle_closed_error(
+    exchange: UserExchangeClient[Any],
+) -> None:
+    registration = await exchange.register_agent(EmptyBehavior)
+    handle = RemoteHandle(exchange, registration.agent_id)
+    await handle.close()
+
+    assert handle.client_id is not None
+    with pytest.raises(HandleClosedError):
+        await handle.action('foo')
+    with pytest.raises(HandleClosedError):
+        await handle.ping()
+    with pytest.raises(HandleClosedError):
+        await handle.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_agent_remote_handle_serialize(
+    exchange: UserExchangeClient[Any],
+) -> None:
+    registration = await exchange.register_agent(EmptyBehavior)
+    async with RemoteHandle(exchange, registration.agent_id) as handle:
         # Note: don't call pickle.dumps here because ThreadExchange
         # is not pickleable so we test __reduce__ directly.
         class_, args = handle.__reduce__()
@@ -160,98 +174,130 @@ def test_agent_remote_handle_serialize(
         assert reconstructed.agent_id == handle.agent_id
 
 
-def test_agent_remote_handle_bind(exchange: UserExchangeClient[Any]) -> None:
-    registration = exchange.register_agent(EmptyBehavior)
-    with exchange.factory().create_agent_client(
+@pytest.mark.asyncio
+async def test_agent_remote_handle_bind(
+    exchange: UserExchangeClient[Any],
+) -> None:
+    registration = await exchange.register_agent(EmptyBehavior)
+    factory = exchange.factory()
+
+    async def _handler(_: Any) -> None:  # pragma: no cover
+        pass
+
+    async with await factory.create_agent_client(
         registration,
-        request_handler=lambda _: None,
+        request_handler=_handler,
     ) as client:
         with pytest.raises(
             ValueError,
-            match=f'Cannot create handle to {registration.agent_id}',
+            match='Cannot create handle to self.',
         ):
-            client.get_handle(registration.agent_id)
+            await client.get_handle(registration.agent_id)
 
 
-def test_client_remote_handle_log_bad_response(
+@pytest.mark.asyncio
+async def test_client_remote_handle_ping_timeout(
+    exchange: UserExchangeClient[Any],
+) -> None:
+    registration = await exchange.register_agent(EmptyBehavior)
+    handle = RemoteHandle(exchange, registration.agent_id)
+    with pytest.raises(TimeoutError):
+        await handle.ping(timeout=0.001)
+
+
+@pytest.mark.asyncio
+async def test_client_remote_handle_log_bad_response(
     launcher: ThreadLauncher,
+    exchange: ExchangeClient[Any],
 ) -> None:
     behavior = EmptyBehavior()
-    with ThreadExchangeFactory().create_user_client() as exchange:
-        with launcher.launch(behavior, exchange) as handle:
-            assert handle.mailbox_id is not None
-            # Should log but not crash
-            handle.exchange.send(
-                PingRequest(src=handle.agent_id, dest=handle.mailbox_id),
-            )
-            assert handle.ping() > 0
+    async with await launcher.launch(behavior, exchange) as handle:
+        # Should log two messages but not crash:
+        #   - User client got an unexpected ping request from agent client
+        #   - Agent client got an unexpected ping response (containing an
+        #     error produced by user) with no corresponding handle to
+        #     send the response to.
+        await handle.exchange.send(
+            PingRequest(src=handle.agent_id, dest=handle.client_id),
+        )
+        assert await handle.ping() > 0
 
-            handle.shutdown()
+        await handle.shutdown()
+        await handle.close()
 
 
-def test_client_remote_handle_actions(
+@pytest.mark.asyncio
+async def test_client_remote_handle_actions(
     launcher: ThreadLauncher,
+    exchange: ExchangeClient[Any],
 ) -> None:
     behavior = CounterBehavior()
-    with ThreadExchangeFactory().create_user_client() as exchange:
-        with launcher.launch(behavior, exchange) as handle:
-            assert handle.ping() > 0
+    async with await launcher.launch(behavior, exchange) as handle:
+        assert await handle.ping() > 0
 
-            handle.action('add', 1).result()
-            count_future: Future[int] = handle.action('count')
-            assert count_future.result() == 1
+        future: asyncio.Future[None] = await handle.action('add', 1)
+        await future
+        count_future: asyncio.Future[int] = await handle.action('count')
+        assert await count_future == 1
 
-            handle.add(1).result()
-            count_future = handle.count()
-            assert count_future.result() == 2  # noqa: PLR2004
+        future = await handle.add(1)
+        await future
+        count_future = await handle.count()
+        assert await count_future == 2  # noqa: PLR2004
 
-            handle.shutdown()
+        await handle.shutdown()
 
 
-def test_client_remote_handle_errors(
+@pytest.mark.asyncio
+async def test_client_remote_handle_errors(
     launcher: ThreadLauncher,
+    exchange: ExchangeClient[Any],
 ) -> None:
     behavior = ErrorBehavior()
-    with ThreadExchangeFactory().create_user_client() as exchange:
-        with launcher.launch(behavior, exchange) as handle:
-            with pytest.raises(
-                RuntimeError,
-                match='This action always fails.',
-            ):
-                handle.action('fails').result()
-            with pytest.raises(AttributeError, match='null'):
-                handle.action('null').result()
+    async with await launcher.launch(behavior, exchange) as handle:
+        action_future = await handle.fails()
+        with pytest.raises(
+            RuntimeError,
+            match='This action always fails.',
+        ):
+            await action_future
 
-            handle.shutdown()
+        null_future: asyncio.Future[None] = await handle.action('null')
+        with pytest.raises(AttributeError, match='null'):
+            await null_future
+
+        await handle.shutdown()
 
 
-def test_client_remote_handle_wait_futures(
+@pytest.mark.asyncio
+async def test_client_remote_handle_wait_futures(
     launcher: ThreadLauncher,
+    exchange: ExchangeClient[Any],
 ) -> None:
-    with ThreadExchangeFactory().create_user_client() as exchange:
-        behavior = SleepBehavior()
-        handle = launcher.launch(behavior, exchange)
-
-        future: Future[None] = handle.action('sleep', TEST_SLEEP)
-        handle.close(wait_futures=True)
-        future.result(timeout=0)
+    behavior = SleepBehavior()
+    async with await launcher.launch(behavior, exchange) as handle:
+        sleep_future = await handle.sleep(TEST_SLEEP)
+        await handle.close(wait_futures=True)
+        await sleep_future
 
         # Still need to shutdown agent to exit properly
-        handle = exchange.get_handle(handle.agent_id)
-        handle.shutdown()
+        shutdown_handle = await exchange.get_handle(handle.agent_id)
+        await shutdown_handle.shutdown()
 
 
-def test_client_remote_handle_cancel_futures(
+@pytest.mark.asyncio
+async def test_client_remote_handle_cancel_futures(
     launcher: ThreadLauncher,
+    exchange: ExchangeClient[Any],
 ) -> None:
-    with ThreadExchangeFactory().create_user_client() as exchange:
-        behavior = SleepBehavior()
-        handle = launcher.launch(behavior, exchange)
+    behavior = SleepBehavior()
+    async with await launcher.launch(behavior, exchange) as handle:
+        sleep_future = await handle.sleep(TEST_SLEEP)
+        await handle.close(wait_futures=False)
 
-        future: Future[None] = handle.action('sleep', TEST_SLEEP)
-        handle.close(wait_futures=False)
-        assert future.cancelled()
+        with pytest.raises(asyncio.CancelledError):
+            await sleep_future
 
         # Still need to shutdown agent to exit properly
-        handle = exchange.get_handle(handle.agent_id)
-        handle.shutdown()
+        shutdown_handle = await exchange.get_handle(handle.agent_id)
+        await shutdown_handle.shutdown()

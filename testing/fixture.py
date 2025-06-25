@@ -1,26 +1,28 @@
 from __future__ import annotations
 
-import asyncio
-import threading
-from collections.abc import Generator
+from collections.abc import AsyncGenerator
+from typing import Any
+from typing import Callable
 
 import pytest
+import pytest_asyncio
+from aiohttp.web import AppRunner
+from aiohttp.web import TCPSite
 
+from academy.exchange import ExchangeFactory
 from academy.exchange import UserExchangeClient
 from academy.exchange.cloud.client import HttpExchangeFactory
 from academy.exchange.cloud.server import create_app
-from academy.exchange.cloud.server import serve_app
 from academy.exchange.hybrid import HybridExchangeFactory
+from academy.exchange.local import LocalExchangeFactory
+from academy.exchange.local import LocalExchangeTransport
 from academy.exchange.redis import RedisExchangeFactory
-from academy.exchange.thread import ThreadExchangeFactory
-from academy.exchange.thread import ThreadExchangeTransport
 from academy.launcher import ThreadLauncher
 from academy.socket import open_port
-from testing.constant import TEST_CONNECTION_TIMEOUT
 
 
-@pytest.fixture
-def http_exchange_factory(
+@pytest_asyncio.fixture
+async def http_exchange_factory(
     http_exchange_server: tuple[str, int],
 ) -> HttpExchangeFactory:
     host, port = http_exchange_server
@@ -38,53 +40,73 @@ def redis_exchange_factory(mock_redis) -> RedisExchangeFactory:
 
 
 @pytest.fixture
-def thread_exchange_factory() -> ThreadExchangeFactory:
-    return ThreadExchangeFactory()
+def local_exchange_factory() -> LocalExchangeFactory:
+    return LocalExchangeFactory()
 
 
-@pytest.fixture
-def exchange() -> Generator[UserExchangeClient[ThreadExchangeTransport]]:
-    with ThreadExchangeFactory().create_user_client(
-        start_listener=False,
-    ) as client:
+EXCHANGE_FACTORY_TYPES = (
+    HttpExchangeFactory,
+    HybridExchangeFactory,
+    RedisExchangeFactory,
+    LocalExchangeFactory,
+)
+
+
+@pytest_asyncio.fixture
+async def get_factory(
+    http_exchange_server: tuple[str, int],
+    mock_redis,
+) -> Callable[[type[ExchangeFactory[Any]]], ExchangeFactory[Any]]:
+    # Typically we would parameterize fixtures on a list of the
+    # factory fixtures defined above. However, request.getfixturevalue does
+    # not work with async fixtures, of which we have a mix, so we need to set
+    # them up manually. Instead, we have a fixture that returns a function
+    # that can create the factories from a parameterized list of factory types.
+    # See: https://github.com/pytest-dev/pytest-asyncio/issues/976
+    def _get_factory_for_testing(
+        factory_type: type[ExchangeFactory[Any]],
+    ) -> ExchangeFactory[Any]:
+        if factory_type is HttpExchangeFactory:
+            host, port = http_exchange_server
+            return HttpExchangeFactory(host, port)
+        elif factory_type is HybridExchangeFactory:
+            return HybridExchangeFactory(redis_host='localhost', redis_port=0)
+        elif factory_type is RedisExchangeFactory:
+            return RedisExchangeFactory(hostname='localhost', port=0)
+        elif factory_type is LocalExchangeFactory:
+            return LocalExchangeFactory()
+        else:
+            raise AssertionError('Unsupported factory type.')
+
+    return _get_factory_for_testing
+
+
+@pytest_asyncio.fixture
+async def exchange() -> AsyncGenerator[
+    UserExchangeClient[LocalExchangeTransport]
+]:
+    factory = LocalExchangeFactory()
+    async with await factory.create_user_client() as client:
         yield client
 
 
 @pytest.fixture
-def launcher() -> Generator[ThreadLauncher]:
-    with ThreadLauncher() as launcher:
+async def launcher() -> AsyncGenerator[ThreadLauncher]:
+    async with ThreadLauncher() as launcher:
         yield launcher
 
 
-@pytest.fixture
-def http_exchange_server() -> Generator[tuple[str, int]]:
+@pytest_asyncio.fixture
+async def http_exchange_server() -> AsyncGenerator[tuple[str, int]]:
     host, port = 'localhost', open_port()
     app = create_app()
-    loop = asyncio.new_event_loop()
-    started = threading.Event()
-    stop = loop.create_future()
 
-    async def _run() -> None:
-        async with serve_app(app, host, port):
-            started.set()
-            await stop
+    runner = AppRunner(app)
+    await runner.setup()
 
-    def _target() -> None:
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(_run())
-        loop.close()
-
-    handle = threading.Thread(target=_target, name='http-exchange-fixture')
-    handle.start()
-
-    started.wait(TEST_CONNECTION_TIMEOUT)
-
-    yield host, port
-
-    loop.call_soon_threadsafe(stop.set_result, None)
-    handle.join(timeout=TEST_CONNECTION_TIMEOUT)
-    if handle.is_alive():  # pragma: no cover
-        raise TimeoutError(
-            'Server thread did not gracefully exit within '
-            f'{TEST_CONNECTION_TIMEOUT} seconds.',
-        )
+    try:
+        site = TCPSite(runner, host, port)
+        await site.start()
+        yield host, port
+    finally:
+        await runner.cleanup()

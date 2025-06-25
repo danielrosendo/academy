@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import functools
 import logging
 import sys
@@ -7,13 +8,10 @@ import time
 import uuid
 from collections.abc import Iterable
 from collections.abc import Mapping
-from concurrent.futures import Future
-from concurrent.futures import wait
 from types import TracebackType
 from typing import Any
 from typing import Generic
 from typing import Protocol
-from typing import runtime_checkable
 from typing import TYPE_CHECKING
 from typing import TypeVar
 
@@ -32,11 +30,11 @@ from academy.exception import HandleNotBoundError
 from academy.exception import MailboxClosedError
 from academy.identifier import AgentId
 from academy.identifier import EntityId
+from academy.identifier import UserId
 from academy.message import ActionRequest
 from academy.message import ActionResponse
 from academy.message import PingRequest
 from academy.message import PingResponse
-from academy.message import RequestMessage
 from academy.message import ResponseMessage
 from academy.message import ShutdownRequest
 from academy.message import ShutdownResponse
@@ -55,7 +53,6 @@ P = ParamSpec('P')
 R = TypeVar('R')
 
 
-@runtime_checkable
 class Handle(Protocol[BehaviorT]):
     """Agent handle protocol.
 
@@ -63,7 +60,7 @@ class Handle(Protocol[BehaviorT]):
     """
 
     agent_id: AgentId[BehaviorT]
-    mailbox_id: EntityId | None
+    client_id: EntityId
 
     def __getattr__(self, name: str) -> Any:
         # This dummy method definition is required to signal to mypy that
@@ -73,13 +70,13 @@ class Handle(Protocol[BehaviorT]):
         # on the concrete type for the BehaviorT that Handle is generic on.
         ...
 
-    def action(
+    async def action(
         self,
         action: str,
         /,
         *args: Any,
         **kwargs: Any,
-    ) -> Future[R]:
+    ) -> asyncio.Future[R]:
         """Invoke an action on the agent.
 
         Args:
@@ -98,7 +95,7 @@ class Handle(Protocol[BehaviorT]):
         """
         ...
 
-    def close(
+    async def close(
         self,
         wait_futures: bool = True,
         *,
@@ -113,7 +110,7 @@ class Handle(Protocol[BehaviorT]):
         """
         ...
 
-    def ping(self, *, timeout: float | None = None) -> float:
+    async def ping(self, *, timeout: float | None = None) -> float:
         """Ping the agent.
 
         Ping the agent and wait to get a response. Agents process messages
@@ -135,7 +132,7 @@ class Handle(Protocol[BehaviorT]):
         """
         ...
 
-    def shutdown(self) -> None:
+    async def shutdown(self) -> None:
         """Instruct the agent to shutdown.
 
         This is non-blocking and will only send the message.
@@ -197,7 +194,7 @@ class ProxyHandle(Generic[BehaviorT]):
     def __init__(self, behavior: BehaviorT) -> None:
         self.behavior = behavior
         self.agent_id: AgentId[BehaviorT] = AgentId.new()
-        self.mailbox_id: EntityId | None = None
+        self.client_id: EntityId = UserId.new()
         self._agent_closed = False
         self._handle_closed = False
 
@@ -215,18 +212,18 @@ class ProxyHandle(Generic[BehaviorT]):
             )
 
         @functools.wraps(method)
-        def func(*args: Any, **kwargs: Any) -> Future[R]:
-            return self.action(name, *args, **kwargs)
+        async def func(*args: Any, **kwargs: Any) -> asyncio.Future[R]:
+            return await self.action(name, *args, **kwargs)
 
         return func
 
-    def action(
+    async def action(
         self,
         action: str,
         /,
         *args: Any,
         **kwargs: Any,
-    ) -> Future[R]:
+    ) -> asyncio.Future[R]:
         """Invoke an action on the agent.
 
         Args:
@@ -246,19 +243,19 @@ class ProxyHandle(Generic[BehaviorT]):
         if self._agent_closed:
             raise MailboxClosedError(self.agent_id)
         elif self._handle_closed:
-            raise HandleClosedError(self.agent_id, self.mailbox_id)
+            raise HandleClosedError(self.agent_id, self.client_id)
 
-        future: Future[R] = Future()
+        future: asyncio.Future[R] = asyncio.get_running_loop().create_future()
         try:
             method = getattr(self.behavior, action)
-            result = method(*args, **kwargs)
+            result = await method(*args, **kwargs)
         except Exception as e:
             future.set_exception(e)
         else:
             future.set_result(result)
         return future
 
-    def close(
+    async def close(
         self,
         wait_futures: bool = True,
         *,
@@ -276,7 +273,7 @@ class ProxyHandle(Generic[BehaviorT]):
         """
         self._handle_closed = True
 
-    def ping(self, *, timeout: float | None = None) -> float:
+    async def ping(self, *, timeout: float | None = None) -> float:
         """Ping the agent.
 
         Ping the agent and wait to get a response. Agents process messages
@@ -302,10 +299,10 @@ class ProxyHandle(Generic[BehaviorT]):
         if self._agent_closed:
             raise MailboxClosedError(self.agent_id)
         elif self._handle_closed:
-            raise HandleClosedError(self.agent_id, self.mailbox_id)
+            raise HandleClosedError(self.agent_id, self.client_id)
         return 0
 
-    def shutdown(self) -> None:
+    async def shutdown(self) -> None:
         """Instruct the agent to shutdown.
 
         This is non-blocking and will only send the message.
@@ -319,7 +316,7 @@ class ProxyHandle(Generic[BehaviorT]):
         if self._agent_closed:
             raise MailboxClosedError(self.agent_id)
         elif self._handle_closed:
-            raise HandleClosedError(self.agent_id, self.mailbox_id)
+            raise HandleClosedError(self.agent_id, self.client_id)
         self._agent_closed = True
 
 
@@ -337,7 +334,6 @@ class UnboundRemoteHandle(Generic[BehaviorT]):
 
     def __init__(self, agent_id: AgentId[BehaviorT]) -> None:
         self.agent_id = agent_id
-        self.mailbox_id = None
 
     def __repr__(self) -> str:
         name = type(self).__name__
@@ -347,15 +343,19 @@ class UnboundRemoteHandle(Generic[BehaviorT]):
         return f'{type(self).__name__}<agent: {self.agent_id}>'
 
     def __getattr__(self, name: str) -> Any:
-        """Raises `AttributeError`."""
         raise AttributeError(
             'Actions cannot be invoked via an unbound handle.',
         )
 
-    def bind_to_exchange(
+    @property
+    def client_id(self) -> EntityId:
+        """Raises [`RuntimeError`][RuntimeError] when unbound."""
+        raise RuntimeError('An unbound handle has no client ID.')
+
+    async def bind_to_exchange(
         self,
         exchange: ExchangeClient[Any],
-    ) -> BoundRemoteHandle[BehaviorT]:
+    ) -> RemoteHandle[BehaviorT]:
         """Bind the handle to an existing mailbox.
 
         Args:
@@ -364,76 +364,70 @@ class UnboundRemoteHandle(Generic[BehaviorT]):
         Returns:
             Remote handle bound to the identifier.
         """
-        return exchange.get_handle(self.agent_id)
+        return await exchange.get_handle(self.agent_id)
 
-    def _send_request(self, request: RequestMessage) -> None:
-        raise HandleNotBoundError(self.agent_id)
-
-    def action(
+    async def action(
         self,
         action: str,
         /,
         *args: Any,
         **kwargs: Any,
-    ) -> Future[R]:
+    ) -> asyncio.Future[R]:
         """Raises [`HandleNotBoundError`][academy.exception.HandleNotBoundError]."""  # noqa: E501
         raise HandleNotBoundError(self.agent_id)
 
-    def close(self) -> None:
+    async def close(self) -> None:
         """Raises [`HandleNotBoundError`][academy.exception.HandleNotBoundError]."""  # noqa: E501
         raise HandleNotBoundError(self.agent_id)
 
-    def ping(self, *, timeout: float | None = None) -> float:
+    async def ping(self, *, timeout: float | None = None) -> float:
         """Raises [`HandleNotBoundError`][academy.exception.HandleNotBoundError]."""  # noqa: E501
         raise HandleNotBoundError(self.agent_id)
 
-    def shutdown(self) -> None:
+    async def shutdown(self) -> None:
         """Raises [`HandleNotBoundError`][academy.exception.HandleNotBoundError]."""  # noqa: E501
         raise HandleNotBoundError(self.agent_id)
 
 
-class BoundRemoteHandle(Generic[BehaviorT]):
-    """Handle to a remote agent bound to an existing mailbox.
+class RemoteHandle(Generic[BehaviorT]):
+    """Handle to a remote agent bound to an exchange client.
 
     Args:
-        exchange: Message exchange used for agent communication.
+        exchange: Exchange client used for agent communication.
         agent_id: EntityId of the target agent of this handle.
-        mailbox_id: EntityId of the mailbox this handle receives messages to.
     """
 
     def __init__(
         self,
         exchange: ExchangeClient[Any],
         agent_id: AgentId[BehaviorT],
-        mailbox_id: EntityId | None = None,
     ) -> None:
-        if agent_id == mailbox_id:
-            raise ValueError(
-                f'Cannot create handle to {agent_id} that is bound to itself. '
-                'Check that the values of `agent_id` and `mailbox_id` '
-                'are different.',
-            )
-
         self.exchange = exchange
         self.agent_id = agent_id
-        self.mailbox_id = mailbox_id
+        self.client_id = exchange.client_id
+
+        if self.agent_id == self.client_id:
+            raise ValueError(
+                'Cannot create handle to self. The IDs of the exchange '
+                f'client and the target agent are the same: {self.agent_id}.',
+            )
         # Unique identifier for each handle object; used to disambiguate
         # messages when multiple handles are bound to the same mailbox.
         self.handle_id = uuid.uuid4()
 
-        self._futures: dict[uuid.UUID, Future[Any]] = {}
+        self._futures: dict[uuid.UUID, asyncio.Future[Any]] = {}
         self._closed = False
 
-    def __enter__(self) -> Self:
+    async def __aenter__(self) -> Self:
         return self
 
-    def __exit__(
+    async def __aexit__(
         self,
         exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
         exc_traceback: TracebackType | None,
     ) -> None:
-        self.close()
+        await self.close()
 
     def __reduce__(
         self,
@@ -446,24 +440,42 @@ class BoundRemoteHandle(Generic[BehaviorT]):
     def __repr__(self) -> str:
         return (
             f'{type(self).__name__}(agent_id={self.agent_id!r}, '
-            f'mailbox_id={self.mailbox_id!r}, exchange={self.exchange!r})'
+            f'client_id={self.client_id!r}, exchange={self.exchange!r})'
         )
 
     def __str__(self) -> str:
         name = type(self).__name__
-        return f'{name}<agent: {self.agent_id}; mailbox: {self.mailbox_id}>'
+        return f'{name}<agent: {self.agent_id}; mailbox: {self.client_id}>'
 
     def __getattr__(self, name: str) -> Any:
-        def remote_method_call(*args: Any, **kwargs: Any) -> Future[R]:
-            return self.action(name, *args, **kwargs)
+        async def remote_method_call(
+            *args: Any,
+            **kwargs: Any,
+        ) -> asyncio.Future[R]:
+            return await self.action(name, *args, **kwargs)
 
         return remote_method_call
+
+    async def bind_to_exchange(
+        self,
+        exchange: ExchangeClient[Any],
+    ) -> RemoteHandle[BehaviorT]:
+        """Bind the handle to an existing mailbox.
+
+        Args:
+            exchange: Client exchange to associate with handle
+
+        Returns:
+            Remote handle bound to the identifier.
+        """
+        unbound = self.clone()
+        return await unbound.bind_to_exchange(exchange)
 
     def clone(self) -> UnboundRemoteHandle[BehaviorT]:
         """Create an unbound copy of this handle."""
         return UnboundRemoteHandle(self.agent_id)
 
-    def _process_response(self, response: ResponseMessage) -> None:
+    async def _process_response(self, response: ResponseMessage) -> None:
         if isinstance(response, (ActionResponse, PingResponse)):
             future = self._futures.pop(response.tag)
             if response.exception is not None:
@@ -480,16 +492,16 @@ class BoundRemoteHandle(Generic[BehaviorT]):
         else:
             raise AssertionError('Unreachable.')
 
-    def _send_request(self, request: RequestMessage) -> None:
-        self.exchange.send(request)
-
-    def close(
+    async def close(
         self,
         wait_futures: bool = True,
         *,
         timeout: float | None = None,
     ) -> None:
         """Close this handle.
+
+        Note:
+            This does not close the exchange client.
 
         Args:
             wait_futures: Wait to return until all pending futures are done
@@ -502,19 +514,22 @@ class BoundRemoteHandle(Generic[BehaviorT]):
             return
         if wait_futures:
             logger.debug('Waiting on pending futures for %s', self)
-            wait(list(self._futures.values()), timeout=timeout)
+            await asyncio.wait(
+                list(self._futures.values()),
+                timeout=timeout,
+            )
         else:
             logger.debug('Cancelling pending futures for %s', self)
             for future in self._futures:
                 self._futures[future].cancel()
 
-    def action(
+    async def action(
         self,
         action: str,
         /,
         *args: Any,
         **kwargs: Any,
-    ) -> Future[R]:
+    ) -> asyncio.Future[R]:
         """Invoke an action on the agent.
 
         Args:
@@ -531,35 +546,30 @@ class BoundRemoteHandle(Generic[BehaviorT]):
                 typically indicates the agent shutdown for another reason
                 (it self terminated or via another handle).
         """
-        if self.mailbox_id is None:
-            # UnboundRemoteHandle overrides these methods and is the only
-            # handle state variant where hid is None.
-            raise AssertionError(
-                'Method should not be reachable in unbound state.',
-            )
         if self._closed:
-            raise HandleClosedError(self.agent_id, self.mailbox_id)
+            raise HandleClosedError(self.agent_id, self.client_id)
 
         request = ActionRequest(
-            src=self.mailbox_id,
+            src=self.client_id,
             dest=self.agent_id,
             label=self.handle_id,
             action=action,
             pargs=args,
             kargs=kwargs,
         )
-        future: Future[R] = Future()
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[R] = loop.create_future()
         self._futures[request.tag] = future
-        self._send_request(request)
+        await self.exchange.send(request)
         logger.debug(
             'Sent action request from %s to %s (action=%r)',
-            self.mailbox_id,
+            self.client_id,
             self.agent_id,
             action,
         )
         return future
 
-    def ping(self, *, timeout: float | None = None) -> float:
+    async def ping(self, *, timeout: float | None = None) -> float:
         """Ping the agent.
 
         Ping the agent and wait to get a response. Agents process messages
@@ -579,36 +589,36 @@ class BoundRemoteHandle(Generic[BehaviorT]):
                 (it self terminated or via another handle).
             TimeoutError: If the timeout is exceeded.
         """
-        if self.mailbox_id is None:
-            # UnboundRemoteHandle overrides these methods and is the only
-            # handle state variant where hid is None.
-            raise AssertionError(
-                'Method should not be reachable in unbound state.',
-            )
         if self._closed:
-            raise HandleClosedError(self.agent_id, self.mailbox_id)
+            raise HandleClosedError(self.agent_id, self.client_id)
 
-        start = time.perf_counter()
         request = PingRequest(
-            src=self.mailbox_id,
+            src=self.client_id,
             dest=self.agent_id,
             label=self.handle_id,
         )
-        future: Future[None] = Future()
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[None] = loop.create_future()
         self._futures[request.tag] = future
-        self._send_request(request)
-        logger.debug('Sent ping from %s to %s', self.mailbox_id, self.agent_id)
-        future.result(timeout=timeout)
+        start = time.perf_counter()
+        await self.exchange.send(request)
+        logger.debug('Sent ping from %s to %s', self.client_id, self.agent_id)
+
+        done, pending = await asyncio.wait({future}, timeout=timeout)
+        if future in pending:
+            raise TimeoutError(
+                f'Did not receive ping response within {timeout} seconds.',
+            )
         elapsed = time.perf_counter() - start
         logger.debug(
             'Received ping from %s to %s in %.1f ms',
-            self.mailbox_id,
+            self.client_id,
             self.agent_id,
             elapsed * 1000,
         )
         return elapsed
 
-    def shutdown(self) -> None:
+    async def shutdown(self) -> None:
         """Instruct the agent to shutdown.
 
         This is non-blocking and will only send the message.
@@ -619,37 +629,17 @@ class BoundRemoteHandle(Generic[BehaviorT]):
                 typically indicates the agent shutdown for another reason
                 (it self terminated or via another handle).
         """
-        if self.mailbox_id is None:
-            # UnboundRemoteHandle overrides these methods and is the only
-            # handle state variant where hid is None.
-            raise AssertionError(
-                'Method should not be reachable in unbound state.',
-            )
         if self._closed:
-            raise HandleClosedError(self.agent_id, self.mailbox_id)
+            raise HandleClosedError(self.agent_id, self.client_id)
 
         request = ShutdownRequest(
-            src=self.mailbox_id,
+            src=self.client_id,
             dest=self.agent_id,
             label=self.handle_id,
         )
-        self._send_request(request)
+        await self.exchange.send(request)
         logger.debug(
             'Sent shutdown request from %s to %s',
-            self.mailbox_id,
+            self.client_id,
             self.agent_id,
         )
-
-    def bind_to_exchange(
-        self,
-        exchange: ExchangeClient[Any],
-    ) -> BoundRemoteHandle[BehaviorT]:
-        """Bind the handle to an existing mailbox.
-
-        Args:
-            exchange: Client exchange to associate with handle
-
-        Returns:
-            Remote handle bound to the identifier.
-        """
-        return self.clone().bind_to_exchange(exchange)

@@ -19,12 +19,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import logging
 import ssl
 import sys
 import uuid
-from collections.abc import AsyncGenerator
 from collections.abc import Awaitable
 from collections.abc import Sequence
 from typing import Any
@@ -32,13 +30,11 @@ from typing import Callable
 
 from aiohttp.web import AppKey
 from aiohttp.web import Application
-from aiohttp.web import AppRunner
 from aiohttp.web import json_response
 from aiohttp.web import middleware
 from aiohttp.web import Request
 from aiohttp.web import Response
 from aiohttp.web import run_app
-from aiohttp.web import TCPSite
 from pydantic import TypeAdapter
 from pydantic import ValidationError
 
@@ -67,6 +63,7 @@ _UNAUTHORIZED_CODE = 401
 _FORBIDDEN_CODE = 403
 _NOT_FOUND_CODE = 404
 _TIMEOUT_CODE = 408
+_NO_RESPONSE_CODE = 444
 
 
 class _MailboxManager:
@@ -317,8 +314,17 @@ async def _send_message_route(request: Request) -> Response:
         return Response(status=_OKAY_CODE)
 
 
-async def _recv_message_route(request: Request) -> Response:
-    data = await request.json()
+async def _recv_message_route(request: Request) -> Response:  # noqa: PLR0911
+    try:
+        data = await request.json()
+    except ConnectionResetError:  # pragma: no cover
+        # This happens when the client cancel's it's listener task, which is
+        # waiting on recv, because the client is shutting down and closing
+        # its connection. In this case, we don't need to do anything
+        # because the client disconnected itself. If we don't catch this
+        # error, aiohttp will just log an error message each time this happens.
+        return Response(status=_NO_RESPONSE_CODE)
+
     manager: _MailboxManager = request.app[MANAGER_KEY]
 
     try:
@@ -420,31 +426,6 @@ def create_app(
     return app
 
 
-@contextlib.asynccontextmanager
-async def serve_app(
-    app: Application,
-    host: str,
-    port: int,
-) -> AsyncGenerator[None]:
-    """Serve an application as a context manager.
-
-    Args:
-        app: Application to run.
-        host: Host to bind to.
-        port: Port to bind to.
-    """
-    runner = AppRunner(app)
-    try:
-        await runner.setup()
-        site = TCPSite(runner, host, port)
-        await site.start()
-        logger.info('Exchange listening on %s:%s', host, port)
-        yield
-    finally:
-        await runner.cleanup()
-        logger.info('Exchange closed!')
-
-
 def _run(
     config: ExchangeServingConfig,
 ) -> None:
@@ -458,7 +439,7 @@ def _run(
     )
 
     ssl_context: ssl.SSLContext | None = None
-    if config.certfile is not None:
+    if config.certfile is not None:  # pragma: no cover
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ssl_context.load_cert_chain(config.certfile, keyfile=config.keyfile)
 
