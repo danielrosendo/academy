@@ -12,6 +12,7 @@ from types import TracebackType
 from typing import Any
 from typing import Generic
 from typing import Protocol
+from typing import runtime_checkable
 from typing import TYPE_CHECKING
 from typing import TypeVar
 
@@ -53,6 +54,7 @@ P = ParamSpec('P')
 R = TypeVar('R')
 
 
+@runtime_checkable
 class Handle(Protocol[BehaviorT]):
     """Agent handle protocol.
 
@@ -475,6 +477,8 @@ class RemoteHandle(Generic[BehaviorT]):
     async def _process_response(self, response: ResponseMessage) -> None:
         if isinstance(response, (ActionResponse, PingResponse)):
             future = self._futures.pop(response.tag)
+            if future.cancelled():
+                return
             if response.exception is not None:
                 future.set_exception(response.exception)
             elif isinstance(response, ActionResponse):
@@ -519,6 +523,10 @@ class RemoteHandle(Generic[BehaviorT]):
             logger.debug('Cancelling pending futures for %s', self)
             for future in self._futures:
                 self._futures[future].cancel()
+
+    def closed(self) -> bool:
+        """Check if the handle has been closed."""
+        return self._closed
 
     async def action(
         self,
