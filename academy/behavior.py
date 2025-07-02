@@ -5,6 +5,7 @@ import functools
 import inspect
 import logging
 import sys
+import warnings
 from collections.abc import Coroutine
 from collections.abc import Generator
 from datetime import timedelta
@@ -290,6 +291,16 @@ class ControlLoop(Protocol):
         ...
 
 
+@functools.lru_cache(maxsize=1)
+def _get_handle_protected_methods() -> tuple[str, ...]:
+    methods: list[str] = []
+    for name, value in inspect.getmembers(Handle):
+        # Only include functions defined on Handle, not inherited ones
+        if inspect.isfunction(value) and name in Handle.__dict__:
+            methods.append(name)
+    return tuple(methods)
+
+
 @overload
 def action(method: ActionMethod[P, R]) -> ActionMethod[P, R]: ...
 
@@ -297,6 +308,7 @@ def action(method: ActionMethod[P, R]) -> ActionMethod[P, R]: ...
 @overload
 def action(
     *,
+    allow_protected_name: bool = False,
     context: bool = False,
 ) -> Callable[[ActionMethod[P, R]], ActionMethod[P, R]]: ...
 
@@ -304,6 +316,7 @@ def action(
 def action(
     method: ActionMethod[P, R] | None = None,
     *,
+    allow_protected_name: bool = False,
     context: bool = False,
 ) -> ActionMethod[P, R] | Callable[[ActionMethod[P, R]], ActionMethod[P, R]]:
     """Decorator that annotates a method of a behavior as an action.
@@ -328,8 +341,20 @@ def action(
                 ...
         ```
 
+    Warning:
+        A warning will be emitted if the decorated method's name clashed
+        with a method of [`Handle`][academy.handle.Handle] because it would
+        not be possible to invoke this action remotely via attribute
+        lookup on a handle. This warning can be suppressed with
+        `allow_protected_name=True`, and the action must be invoked via
+        [`Handle.action()`][academy.handle.Handle.action].
+
     Args:
         method: Method to decorate as an action.
+        allow_protected_name: Allow decorating a method as an action when
+            the name of the method clashes with a protected method name of
+            [`Handle`][academy.handle.Handle]. This flag silences the
+            emitted warning.
         context: Specify that the action method expects a context argument.
             The `context` will be provided at runtime as a keyword argument.
 
@@ -339,6 +364,18 @@ def action(
     """
 
     def decorator(method_: ActionMethod[P, R]) -> ActionMethod[P, R]:
+        if (
+            not allow_protected_name
+            and method_.__name__ in _get_handle_protected_methods()
+        ):
+            warnings.warn(
+                f'The name of the decorated method is "{method_.__name__}" '
+                'which clashes with a protected method of Handle. '
+                'Rename the decorated method to avoid ambiguity when remotely '
+                'invoking it via a handle.',
+                UserWarning,
+                stacklevel=3,
+            )
         # Typing the requirement that if context=True then params P should
         # contain a keyword argument named "context" is not easily annotated
         # for mypy so instead we check at runtime.
