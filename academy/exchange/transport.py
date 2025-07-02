@@ -103,6 +103,9 @@ class ExchangeTransport(Protocol[AgentRegistrationT_co]):
 
         Returns:
             Tuple of agent IDs implementing the behavior.
+
+        Raises:
+            ExchangeError: Error returned by the exchange.
         """
         ...
 
@@ -122,7 +125,8 @@ class ExchangeTransport(Protocol[AgentRegistrationT_co]):
                 next message or the mailbox is closed.
 
         Raises:
-            MailboxClosedError: If the mailbox was closed.
+            MailboxTerminatedError: If the mailbox was closed.
+            ExchangeError: Error returned by the exchange.
             TimeoutError: If a `timeout` was specified and exceeded.
         """
         ...
@@ -141,6 +145,9 @@ class ExchangeTransport(Protocol[AgentRegistrationT_co]):
 
         Returns:
             Agent registration info.
+
+        Raises:
+            ExchangeError: Error returned by the exchange.
         """
         ...
 
@@ -152,7 +159,8 @@ class ExchangeTransport(Protocol[AgentRegistrationT_co]):
 
         Raises:
             BadEntityIdError: If a mailbox for `message.dest` does not exist.
-            MailboxClosedError: If the mailbox was closed.
+            MailboxTerminatedError: If the mailbox was closed.
+            ExchangeError: Error returned by the exchange.
         """
         ...
 
@@ -161,6 +169,9 @@ class ExchangeTransport(Protocol[AgentRegistrationT_co]):
 
         Args:
             uid: Entity identifier of the mailbox to check.
+
+        Raises:
+            ExchangeError: Error returned by the exchange.
         """
         ...
 
@@ -175,6 +186,9 @@ class ExchangeTransport(Protocol[AgentRegistrationT_co]):
 
         Args:
             uid: Entity identifier of the mailbox to close.
+
+        Raises:
+            ExchangeError: Error returned by the exchange.
         """
         ...
 

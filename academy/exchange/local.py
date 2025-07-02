@@ -20,7 +20,7 @@ from culsans import Queue
 from academy.behavior import Behavior
 from academy.behavior import BehaviorT
 from academy.exception import BadEntityIdError
-from academy.exception import MailboxClosedError
+from academy.exception import MailboxTerminatedError
 from academy.exchange import ExchangeFactory
 from academy.exchange.transport import ExchangeTransportMixin
 from academy.exchange.transport import MailboxStatus
@@ -129,7 +129,7 @@ class LocalExchangeTransport(ExchangeTransportMixin, NoPickleMixin):
                 f'after {timeout} seconds.',
             ) from None
         except QueueShutDown:
-            raise MailboxClosedError(self.mailbox_id) from None
+            raise MailboxTerminatedError(self.mailbox_id) from None
 
     async def register_agent(
         self,
@@ -149,7 +149,7 @@ class LocalExchangeTransport(ExchangeTransportMixin, NoPickleMixin):
         try:
             await queue.put(message)
         except QueueShutDown:
-            raise MailboxClosedError(message.dest) from None
+            raise MailboxTerminatedError(message.dest) from None
 
     async def status(self, uid: EntityId) -> MailboxStatus:
         if uid not in self._state.queues:

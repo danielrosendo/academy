@@ -4,12 +4,19 @@ import logging
 import pickle
 from unittest import mock
 
+import aiohttp
 import pytest
 
+from academy.exception import BadEntityIdError
+from academy.exception import ForbiddenError
+from academy.exception import MailboxTerminatedError
+from academy.exception import UnauthorizedError
+from academy.exchange.cloud.client import _raise_for_status
 from academy.exchange.cloud.client import HttpExchangeFactory
 from academy.exchange.cloud.client import HttpExchangeTransport
 from academy.exchange.cloud.client import spawn_http_exchange
-from academy.exchange.cloud.server import _TIMEOUT_CODE
+from academy.exchange.cloud.server import StatusCode
+from academy.identifier import UserId
 from academy.socket import open_port
 from testing.constant import TEST_CONNECTION_TIMEOUT
 
@@ -28,7 +35,7 @@ async def test_recv_timeout(http_exchange_server: tuple[str, int]) -> None:
     factory = HttpExchangeFactory(host, port)
 
     class MockResponse:
-        status = _TIMEOUT_CODE
+        status = StatusCode.TIMEOUT.value
 
         async def __aexit__(self, exc_type, exc, tb):
             pass
@@ -57,6 +64,35 @@ async def test_additional_headers(
     async with await factory._create_transport() as transport:
         assert isinstance(transport, HttpExchangeTransport)
         assert 'Authorization' in transport._session.headers
+
+
+async def test_raise_for_status_error_conversion() -> None:
+    class _MockResponse(aiohttp.ClientResponse):
+        def __init__(self, status: int) -> None:
+            self.status = status
+
+    response = _MockResponse(StatusCode.OKAY.value)
+    _raise_for_status(response, UserId.new())
+
+    response = _MockResponse(StatusCode.UNAUTHORIZED.value)
+    with pytest.raises(UnauthorizedError):
+        _raise_for_status(response, UserId.new())
+
+    response = _MockResponse(StatusCode.FORBIDDEN.value)
+    with pytest.raises(ForbiddenError):
+        _raise_for_status(response, UserId.new())
+
+    response = _MockResponse(StatusCode.NOT_FOUND.value)
+    with pytest.raises(BadEntityIdError):
+        _raise_for_status(response, UserId.new())
+
+    response = _MockResponse(StatusCode.TERMINATED.value)
+    with pytest.raises(MailboxTerminatedError):
+        _raise_for_status(response, UserId.new())
+
+    response = _MockResponse(StatusCode.TIMEOUT.value)
+    with pytest.raises(TimeoutError):
+        _raise_for_status(response, UserId.new())
 
 
 @pytest.mark.asyncio

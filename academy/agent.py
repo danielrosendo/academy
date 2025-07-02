@@ -14,8 +14,8 @@ from typing import TypeVar
 from academy.behavior import BehaviorT
 from academy.context import ActionContext
 from academy.context import AgentContext
-from academy.exception import BadEntityIdError
-from academy.exception import MailboxClosedError
+from academy.exception import ExchangeError
+from academy.exception import MailboxTerminatedError
 from academy.exception import raise_exceptions
 from academy.exchange import AgentExchangeClient
 from academy.exchange import ExchangeFactory
@@ -143,11 +143,16 @@ class Agent(Generic[BehaviorT], NoPickleMixin):
         assert self._exchange_client is not None
         try:
             await self._exchange_client.send(response)
-        except (BadEntityIdError, MailboxClosedError):  # pragma: no cover
+        except MailboxTerminatedError:  # pragma: no cover
             logger.warning(
-                'Failed to send response from %s to %s. '
-                'This likely means the destination mailbox was '
-                'removed from the exchange.',
+                'Failed to send response from %s to %s because the '
+                'destination mailbox was terminated.',
+                self.agent_id,
+                response.dest,
+            )
+        except ExchangeError:  # pragma: no cover
+            logger.exception(
+                'Failed to send response from %s to %s.',
                 self.agent_id,
                 response.dest,
             )
