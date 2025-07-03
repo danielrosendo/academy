@@ -33,13 +33,13 @@ async with await Manager(..., executors=executor) as manager:
 
 This section highlights common best practices for developing applications in Academy.
 
-### Avoid communication operations during behavior initialization
+### Avoid communication operations during agent initialization
 
-The `__init__` method of a [`Behavior`][academy.behavior.Behavior] is called in one of two places:
+The `__init__` method of an [`Agent`][academy.agent.Agent] is called in one of two places:
 
-1. On the client when submitting an instantiated behavior to be executed.
-1. On the agent at the start of the setup sequence when the behavior instantiation is deferred.
+1. On the client when submitting an agent to be executed.
+1. On the worker at the start of the setup sequence when agent instantiation is deferred.
 
 In both scenarios, it is unsafe to perform communication operations (i.e., invoking an action on a remote agent) in `__init__` because connection resources and background tasks have not yet been initialized.
 
-The [`Behavior.on_setup()`][academy.behavior.Behavior.on_setup] callback can be used instead to perform communication once the agent is in a running state.
+The [`Agent.on_setup()`][academy.agent.Agent.on_setup] callback can be used instead to perform communication once the agent is in a running state.

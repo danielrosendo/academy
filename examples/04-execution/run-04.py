@@ -5,8 +5,8 @@ import logging
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 
-from academy.behavior import action
-from academy.behavior import Behavior
+from academy.agent import action
+from academy.agent import Agent
 from academy.exchange.cloud.client import spawn_http_exchange
 from academy.handle import Handle
 from academy.logging import init_logging
@@ -16,7 +16,7 @@ EXCHANGE_PORT = 5346
 logger = logging.getLogger(__name__)
 
 
-class Coordinator(Behavior):
+class Coordinator(Agent):
     def __init__(
         self,
         lowerer: Handle[Lowerer],
@@ -35,13 +35,13 @@ class Coordinator(Behavior):
         return text
 
 
-class Lowerer(Behavior):
+class Lowerer(Agent):
     @action
     async def lower(self, text: str) -> str:
         return text.lower()
 
 
-class Reverser(Behavior):
+class Reverser(Agent):
     @action
     async def reverse(self, text: str) -> str:
         return text[::-1]
@@ -64,9 +64,8 @@ async def main() -> int:
             # process pool executor.
             executors=executor,
         ) as manager:
-            # Launch each of the three agents, each implementing a different
-            # behavior. The returned type is a handle to that agent used to
-            # invoke actions.
+            # Launch each of the three agents types. The returned type is
+            # a handle to that agent used to invoke actions.
             lowerer = await manager.launch(Lowerer)
             reverser = await manager.launch(Reverser)
             coordinator = await manager.launch(

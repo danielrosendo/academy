@@ -21,16 +21,16 @@ pip install academy-py
 
 ## Example
 
-Agents in Academy are defined by a `Behavior`, a class with methods decorated with `@action` can be invoked by peers and method decorated with `@loop` run autonomous control loops.
+Agents in Academy are defined by an `Agent` class containing `@action`-decorated methods that can be invoked by users or peer agents and `@loop`-decorated methods that execute the autonomous control loops of the agent.
 
-The below sensor monitoring behavior periodically reads a sensor in the `monitor()` loop and processes the reading if a threshold is met.
-Clients or peers can invoke the `get_last_reading()` and `set_process_threshold()` actions remotely to interact with the monitor agent.
+The below sensor monitoring agent periodically reads a sensor in the `monitor()` loop and processes the reading if a threshold is met.
+Users or agents can invoke the `get_last_reading()` and `set_process_threshold()` actions remotely to interact with the monitor agent.
 
 ```python
 import asyncio
-from academy.behavior import Behavior, action, loop
+from academy.agent import Agent, action, loop
 
-class SensorMonitorAgent(Behavior):
+class SensorMonitorAgent(Agent):
     def __init__(self) -> None:
         super().__init__()
         self.last_reading: float | None = None
@@ -54,7 +54,7 @@ class SensorMonitorAgent(Behavior):
             await asyncio.sleep(1)
 ```
 
-Entities communicate asynchronously through *handles*, sending messages to and receiving messages from a mailbox managed by an *exchange*.
+Users and agents communicate asynchronously through *handles*, sending messages to and receiving messages from a mailbox managed by an *exchange*.
 The *manager* abstracts the remote execution and management of agents using [executors](https://docs.python.org/3/library/concurrent.futures.html).
 
 ```python

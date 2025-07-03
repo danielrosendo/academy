@@ -1,459 +1,596 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import dataclasses
-import enum
+import functools
+import inspect
 import logging
-from collections.abc import Awaitable
+import sys
+import warnings
+from collections.abc import Coroutine
+from collections.abc import Generator
+from datetime import timedelta
 from typing import Any
 from typing import Callable
 from typing import Generic
+from typing import Literal
+from typing import overload
+from typing import Protocol
+from typing import TYPE_CHECKING
 from typing import TypeVar
 
-from academy.behavior import BehaviorT
-from academy.context import ActionContext
-from academy.context import AgentContext
-from academy.exception import ExchangeError
-from academy.exception import MailboxTerminatedError
-from academy.exception import raise_exceptions
-from academy.exchange import AgentExchangeClient
-from academy.exchange import ExchangeFactory
-from academy.exchange.transport import AgentRegistrationT
-from academy.exchange.transport import ExchangeTransportT
+if sys.version_info >= (3, 10):  # pragma: >=3.10 cover
+    from typing import ParamSpec
+    from typing import TypeAlias
+else:  # pragma: <3.10 cover
+    from typing_extensions import ParamSpec
+    from typing_extensions import TypeAlias
+
+if sys.version_info >= (3, 11):  # pragma: >=3.11 cover
+    from typing import Self
+else:  # pragma: <3.11 cover
+    from typing_extensions import Self
+
+from academy.event import wait_event_async
+from academy.exception import AgentNotInitializedError
 from academy.handle import Handle
 from academy.handle import HandleDict
 from academy.handle import HandleList
 from academy.handle import ProxyHandle
 from academy.handle import RemoteHandle
 from academy.handle import UnboundRemoteHandle
-from academy.identifier import EntityId
-from academy.message import ActionRequest
-from academy.message import PingRequest
-from academy.message import RequestMessage
-from academy.message import ResponseMessage
-from academy.message import ShutdownRequest
-from academy.serialize import NoPickleMixin
+
+if TYPE_CHECKING:
+    from academy.context import AgentContext
+    from academy.exchange import AgentExchangeClient
+    from academy.identifier import AgentId
+
+AgentT = TypeVar('AgentT', bound='Agent')
+"""Type variable bound to [`Agent`][academy.agent.Agent]."""
+
+P = ParamSpec('P')
+R = TypeVar('R')
+R_co = TypeVar('R_co', covariant=True)
+ActionMethod: TypeAlias = Callable[P, Coroutine[None, None, R]]
+LoopMethod: TypeAlias = Callable[
+    [AgentT, asyncio.Event],
+    Coroutine[None, None, None],
+]
 
 logger = logging.getLogger(__name__)
 
-T = TypeVar('T')
 
+class Agent:
+    """Agent base class.
 
-class _AgentState(enum.Enum):
-    INITIALIZED = 'initialized'
-    STARTING = 'starting'
-    RUNNING = 'running'
-    TERMINTATING = 'terminating'
-    SHUTDOWN = 'shutdown'
+    An agent is composed of three parts:
+      1. The [`on_startup()`][academy.agent.Agent.on_setup] and
+         [`on_shutdown()`][academy.agent.Agent.on_shutdown] methods
+         define callbacks that are invoked once at the start and end of an
+         agent's execution, respectively. The methods should be used to
+         initialize and cleanup stateful resources. Resource initialization
+         should not be performed in `__init__`.
+      2. Action methods annotated with [`@action`][academy.agent.action]
+         are methods that other agents can invoke on this agent. An agent
+         may also call it's own action methods as normal methods.
+      3. Control loop methods annotated with [`@loop`][academy.agent.loop]
+         are executed in separate threads when the agent is executed.
 
-
-@dataclasses.dataclass
-class _AgentShutdownOptions:
-    # If the shutdown was expected or due to an error
-    expected_shutdown: bool = True
-    # Override the termination setting of the run config
-    terminate_override: bool | None = None
-
-
-@dataclasses.dataclass(frozen=True)
-class AgentRunConfig:
-    """Agent run configuration.
-
-    Attributes:
-        max_action_concurrency: Maximum size of the thread pool used to
-            concurrently execute action requests.
-        shutdown_on_loop_error: Shutdown the agent if any loop raises an error.
-        terminate_on_error: Terminate the agent by closing its mailbox
-            permanently if the agent shuts down due to an error.
-        terminate_on_success: Terminate the agent by closing its mailbox
-            permanently if the agent shuts down without an error.
-    """
-
-    max_action_concurrency: int | None = None
-    shutdown_on_loop_error: bool = True
-    terminate_on_error: bool = True
-    terminate_on_success: bool = True
-
-
-class Agent(Generic[BehaviorT], NoPickleMixin):
-    """Executable agent.
-
-    An agent executes predefined [`Behavior`][academy.behavior.Behavior]. An
-    agent can operate independently or as part of a broader multi-agent
-    system.
-
-    Note:
-        An agent can only be run once. Calling
-        [`run()`][academy.agent.Agent.run] multiple times will raise a
-        [`RuntimeError`][RuntimeError].
-
-    Note:
-        If any `@loop` method raises an error, the agent will be signaled
-        to shutdown if `shutdown_on_loop_error` is set in the `config`.
-
-    Args:
-        behavior: Behavior that the agent will exhibit.
-        exchange_factory: Message exchange factory.
-        registration: Agent registration info returned by the exchange.
-        config: Agent execution parameters.
-    """
-
-    def __init__(
-        self,
-        behavior: BehaviorT,
-        *,
-        exchange_factory: ExchangeFactory[ExchangeTransportT],
-        registration: AgentRegistrationT,
-        config: AgentRunConfig | None = None,
-    ) -> None:
-        self.agent_id = registration.agent_id
-        self.behavior = behavior
-        self.factory = exchange_factory
-        self.registration = registration
-        self.config = config if config is not None else AgentRunConfig()
-
-        self._actions = behavior.behavior_actions()
-        self._loops = behavior.behavior_loops()
-
-        self._started_event = asyncio.Event()
-        self._shutdown_event = asyncio.Event()
-        self._shutdown_options = _AgentShutdownOptions()
-        self._behavior_startup_called = False
-
-        self._action_tasks: dict[ActionRequest, asyncio.Task[None]] = {}
-        self._loop_tasks: dict[str, asyncio.Task[None]] = {}
-        self._loop_exceptions: list[tuple[str, Exception]] = []
-
-        self._exchange_client: (
-            AgentExchangeClient[BehaviorT, ExchangeTransportT] | None
-        ) = None
-        self._exchange_listener_task: asyncio.Task[None] | None = None
-
-    def __repr__(self) -> str:
-        name = type(self).__name__
-        return f'{name}({self.behavior!r}, {self._exchange_client!r})'
-
-    def __str__(self) -> str:
-        name = type(self).__name__
-        behavior = type(self.behavior).__name__
-        return f'{name}<{behavior}; {self.agent_id}>'
-
-    async def _send_response(self, response: ResponseMessage) -> None:
-        assert self._exchange_client is not None
-        try:
-            await self._exchange_client.send(response)
-        except MailboxTerminatedError:  # pragma: no cover
-            logger.warning(
-                'Failed to send response from %s to %s because the '
-                'destination mailbox was terminated.',
-                self.agent_id,
-                response.dest,
-            )
-        except ExchangeError:  # pragma: no cover
-            logger.exception(
-                'Failed to send response from %s to %s.',
-                self.agent_id,
-                response.dest,
-            )
-
-    async def _execute_action(self, request: ActionRequest) -> None:
-        try:
-            result = await self.action(
-                request.action,
-                request.src,
-                args=request.pargs,
-                kwargs=request.kargs,
-            )
-        except Exception as e:
-            response = request.error(exception=e)
-        else:
-            response = request.response(result=result)
-        await self._send_response(response)
-
-    async def _execute_loop(
-        self,
-        name: str,
-        method: Callable[[asyncio.Event], Awaitable[None]],
-    ) -> None:
-        try:
-            await method(self._shutdown_event)
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            self._loop_exceptions.append((name, e))
-            logger.exception(
-                'Error in loop %r (signaling shutdown: %s)',
-                name,
-                self.config.shutdown_on_loop_error,
-            )
-            if self.config.shutdown_on_loop_error:
-                self.signal_shutdown(expected=False)
-
-    async def _request_handler(self, request: RequestMessage) -> None:
-        if isinstance(request, ActionRequest):
-            task = asyncio.create_task(
-                self._execute_action(request),
-                name=f'execute-action-{request.action}-{request.tag}',
-            )
-            self._action_tasks[request] = task
-            task.add_done_callback(
-                lambda _: self._action_tasks.pop(request),
-            )
-        elif isinstance(request, PingRequest):
-            logger.info('Ping request received by %s', self.agent_id)
-            await self._send_response(request.response())
-        elif isinstance(request, ShutdownRequest):
-            self.signal_shutdown(expected=True, terminate=request.terminate)
-        else:
-            raise AssertionError('Unreachable.')
-
-    async def action(
-        self,
-        action: str,
-        source_id: EntityId,
-        *,
-        args: Any,
-        kwargs: Any,
-    ) -> Any:
-        """Invoke an action of the agent's behavior.
-
-        Args:
-            action: Name of action to invoke.
-            source_id: ID of the source that requested the action.
-            args: Tuple of positional arguments.
-            kwargs: Dictionary of keyword arguments.
-
-        Returns:
-            Result of the action.
-
-        Raises:
-            AttributeError: If an action with this name is not implemented by
-                the agent's behavior.
-        """
-        logger.debug('Invoking "%s" action on %s', action, self.agent_id)
-        if action not in self._actions:
-            raise AttributeError(
-                f'{self.behavior} does not have an action named "{action}".',
-            )
-        action_method = self._actions[action]
-        if action_method._action_method_context:
-            assert self._exchange_client is not None
-            context = ActionContext(source_id, self._exchange_client)
-            return await action_method(*args, context=context, **kwargs)
-        else:
-            return await action_method(*args, **kwargs)
-
-    async def run(self) -> None:
-        """Run the agent.
-
-        Agent setup involves:
-
-        1. Creates a new exchange client for the agent.
-        1. Sets the runtime context on the behavior.
-        1. Binds all handles of the behavior to this agent's exchange client.
-        1. Starts a [`Task`][asyncio.Task] to listen for messages in the
-           agent's mailbox in the exchange.
-        1. Starts a [`Task`][asyncio.Task] for all control loops defined on
-           the behavior.
-        1. Calls [`Behavior.on_setup()`][academy.behavior.Behavior.on_setup].
-
-        After setup succeeds, this method waits for the agent to be shutdown,
-        such as due to a failure in a control loop or receiving a shutdown
-        message.
-
-        Agent shutdown involves:
-
-        1. Calls
-           [`Behavior.on_shutdown()`][academy.behavior.Behavior.on_shutdown].
-        1. Cancels running control loop tasks.
-        1. Cancels the mailbox message listener task so no new requests are
-           received.
-        1. Waits for any currently executing actions to complete.
-        1. Terminates the agent's mailbox in the exchange if configured.
-        1. Closes the exchange client.
-
-        Raises:
-            RuntimeError: If the agent has already been shutdown.
-            Exception: Any exceptions raised during startup, shutdown, or
-                inside of control loops.
-        """
-        try:
-            await self._start()
-        except:
-            logger.exception('Agent startup failed (%r)', self)
-            self.signal_shutdown(expected=False)
-            await self._shutdown()
-            raise
-
-        try:
-            await self._shutdown_event.wait()
-        finally:
-            await self._shutdown()
-
-            # Raise loop exceptions so the caller of run() sees the errors,
-            # even if the loop errors didn't cause the shutdown.
-            raise_exceptions(
-                (e for _, e in self._loop_exceptions),
-                message='Caught failures in agent loops while shutting down.',
-            )
-
-    async def _start(self) -> None:
-        if self._shutdown_event.is_set():
-            raise RuntimeError('Agent has already been shutdown.')
-
-        logger.debug(
-            'Starting agent... (%s; %s)',
-            self.agent_id,
-            self.behavior,
-        )
-
-        self._exchange_client = await self.factory.create_agent_client(
-            self.registration,
-            request_handler=self._request_handler,
-        )
-
-        context = AgentContext(
-            agent_id=self.agent_id,
-            exchange_client=self._exchange_client,
-            shutdown_event=self._shutdown_event,
-        )
-        self.behavior._agent_set_context(context)
-        _bind_behavior_handles(self.behavior, self._exchange_client)
-
-        self._exchange_listener_task = asyncio.create_task(
-            self._exchange_client._listen_for_messages(),
-            name=f'exchange-listener-{self.agent_id}',
-        )
-
-        for name, method in self._loops.items():
-            task = asyncio.create_task(
-                self._execute_loop(name, method),
-                name=f'execute-loop-{name}-{self.agent_id}',
-            )
-            self._loop_tasks[name] = task
-
-        await self.behavior.on_setup()
-        self._behavior_startup_called = True
-
-        self._started_event.set()
-        logger.info('Running agent (%s; %s)', self.agent_id, self.behavior)
-
-    def _should_terminate_mailbox(self) -> bool:
-        # Inspects the shutdown options and the run config to determine
-        # if the agent's mailbox should be terminated in the exchange.
-        if self._shutdown_options.terminate_override is not None:
-            return self._shutdown_options.terminate_override
-
-        expected = self._shutdown_options.expected_shutdown
-        terminate_for_success = self.config.terminate_on_success and expected
-        terminate_for_error = self.config.terminate_on_error and not expected
-        return terminate_for_success or terminate_for_error
-
-    async def _shutdown(self) -> None:
-        assert self._shutdown_event.is_set()
-
-        logger.debug(
-            'Shutting down agent... (expected: %s; %s; %s)',
-            self._shutdown_options.expected_shutdown,
-            self.agent_id,
-            self.behavior,
-        )
-
-        if self._behavior_startup_called:
-            # Don't call on_shutdown() if we never called on_setup()
-            await self.behavior.on_shutdown()
-
-        # Cancel running control loop tasks
-        for task in self._loop_tasks.values():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-
-        # If _start() fails early, the listener task may not have started.
-        if self._exchange_listener_task is not None:
-            self._exchange_listener_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._exchange_listener_task
-
-        # Wait for running actions to complete
-        for task in tuple(self._action_tasks.values()):
-            await task
-
-        if self._exchange_client is not None:
-            if self._should_terminate_mailbox():
-                await self._exchange_client.terminate(self.agent_id)
-            await self._exchange_client.close()
-
-        logger.info('Shutdown agent (%s; %s)', self.agent_id, self.behavior)
-
-    def signal_shutdown(
-        self,
-        *,
-        expected: bool = True,
-        terminate: bool | None = None,
-    ) -> None:
-        """Signal that the agent should exit.
-
-        If the agent has not started, this will cause the agent to immediately
-        shutdown when next started. If the agent is shutdown, this has no
-        effect.
-
-        Args:
-            expected: If the reason for the shutdown was due to normal
-                expected reasons or due to unexpected errors.
-            terminate: Optionally override the mailbox termination settings
-                in the run config.
-        """
-        self._shutdown_options = _AgentShutdownOptions(
-            expected_shutdown=expected,
-            terminate_override=terminate,
-        )
-        self._shutdown_event.set()
-
-
-def _bind_behavior_handles(
-    behavior: BehaviorT,
-    client: AgentExchangeClient[BehaviorT, Any],
-) -> None:
-    """Bind all handle instance attributes on a behavior.
+    The [`Runtime`][academy.runtime.Runtime] is used to execute an agent
+    definition.
 
     Warning:
-        This mutates the behavior, replacing the attributes with new handles
-        bound to the agent's exchange client.
-
-    Args:
-        behavior: The behavior to bind handles on.
-        client: The agent's exchange client used to bind the handles.
+        This class cannot be instantiated directly and must be subclassed.
     """
 
-    def _bind(handle: Handle[BehaviorT]) -> Handle[BehaviorT]:
-        if isinstance(handle, ProxyHandle):
-            return handle
-        if (
-            isinstance(handle, RemoteHandle)
-            and handle.client_id == client.client_id
-        ):
-            return handle
-
-        assert isinstance(handle, (UnboundRemoteHandle, RemoteHandle))
-        bound = client.get_handle(handle.agent_id)
-        logger.debug(
-            'Bound %s of %s to %s',
-            handle,
-            behavior,
-            client.client_id,
-        )
-        return bound
-
-    for attr, handles in behavior.behavior_handles().items():
-        if isinstance(handles, HandleDict):
-            bound_dict = HandleDict(
-                {k: _bind(h) for k, h in handles.items()},
+    def __new__(cls, *args: Any, **kwargs: Any) -> Self:  # noqa: D102
+        if cls is Agent:
+            raise TypeError(
+                f'The {cls.__name__} type cannot be instantiated directly '
+                'and must be subclassed.',
             )
-            setattr(behavior, attr, bound_dict)
-        elif isinstance(handles, HandleList):
-            bound_list = HandleList([_bind(h) for h in handles])
-            setattr(behavior, attr, bound_list)
-        else:
-            setattr(behavior, attr, _bind(handles))
+        return super().__new__(cls)
+
+    def __init__(self) -> None:
+        self.__agent_context: AgentContext[Self] | None = None
+
+    def __repr__(self) -> str:
+        return f'{type(self).__name__}()'
+
+    def __str__(self) -> str:
+        return f'Agent<{type(self).__name__}>'
+
+    def _agent_set_context(self, context: AgentContext[Self]) -> None:
+        self.__agent_context = context
+
+    @property
+    def agent_context(self) -> AgentContext[Self]:
+        """Agent runtime context.
+
+        Raises:
+            AgentNotInitializedError: If the agent runtime implementing
+                this agent has not been started.
+        """
+        if (
+            # Check _Agent__agent_context rather than __agent_context
+            # because of Python's name mangling
+            not hasattr(self, '_Agent__agent_context')
+            or self.__agent_context is None
+        ):
+            raise AgentNotInitializedError
+        return self.__agent_context
+
+    @property
+    def agent_id(self) -> AgentId[Self]:
+        """Agent Id.
+
+        Raises:
+            AgentNotInitializedError: If the agent runtime implementing
+                this agent has not been started.
+        """
+        return self.agent_context.agent_id
+
+    @property
+    def agent_exchange_client(self) -> AgentExchangeClient[Self, Any]:
+        """Agent exchange client.
+
+        Raises:
+            AgentNotInitializedError: If the agent runtime implementing
+                this agent has not been started.
+        """
+        return self.agent_context.exchange_client
+
+    def agent_shutdown(self) -> None:
+        """Request the agent to shutdown.
+
+        Raises:
+            AgentNotInitializedError: If the agent runtime implementing
+                this agent has not been started.
+        """
+        self.agent_context.shutdown_event.set()
+
+    def _agent_attributes(self) -> Generator[tuple[str, Any]]:
+        for name in dir(self):
+            if name in Agent.__dict__:
+                # Skip checking attributes of the base Agent. Checking
+                # the type of properties that access agent_context may
+                # raise an AgentNotInitializedError.
+                continue
+            attr = getattr(self, name)
+            yield name, attr
+
+    def agent_actions(self) -> dict[str, Action[Any, Any]]:
+        """Get methods of this agent type that are decorated as actions.
+
+        Returns:
+            Dictionary mapping method names to action methods.
+        """
+        actions: dict[str, Action[Any, Any]] = {}
+        for name, attr in self._agent_attributes():
+            if _is_agent_method_type(attr, 'action'):
+                actions[name] = attr
+        return actions
+
+    def agent_loops(self) -> dict[str, ControlLoop]:
+        """Get methods of this agent type that are decorated as loops.
+
+        Returns:
+            Dictionary mapping method names to loop methods.
+        """
+        loops: dict[str, ControlLoop] = {}
+        for name, attr in self._agent_attributes():
+            if _is_agent_method_type(attr, 'loop'):
+                loops[name] = attr
+        return loops
+
+    def agent_handles(
+        self,
+    ) -> dict[
+        str,
+        Handle[Any] | HandleDict[Any, Any] | HandleList[Any],
+    ]:
+        """Get instance attributes that are agent handles.
+
+        Returns:
+            Dictionary mapping attribute names to agent handles or \
+            data structures of handles.
+        """
+        handle_types = (
+            ProxyHandle,
+            UnboundRemoteHandle,
+            RemoteHandle,
+            HandleDict,
+            HandleList,
+        )
+        handles: dict[
+            str,
+            Handle[Any] | HandleDict[Any, Any] | HandleList[Any],
+        ] = {}
+        for name, attr in self._agent_attributes():
+            if isinstance(attr, handle_types):
+                handles[name] = attr
+        return handles
+
+    @classmethod
+    def agent_mro(cls) -> tuple[str, ...]:
+        """Get the method resolution order of the agent.
+
+        Example:
+            ```python
+            >>> from academy.agent import Agent
+            >>>
+            >>> class A(Agent): ...
+            >>> class B(Agent): ...
+            >>> class C(A): ...
+            >>> class D(A, B): ...
+            >>>
+            >>> A.agent_mro()
+            ('__main__.A',)
+            >>> B.agent_mro()
+            ('__main__.B',)
+            >>> C.agent_mro()
+            ('__main__.C', '__main__.A')
+            >>> D.agent_mro()
+            ('__main__.D', '__main__.A', '__main__.B')
+            ```
+
+        Returns:
+            Tuple of fully-qualified paths of types in the MRO of this \
+            agent type, not including the base \
+            [`Agent`][academy.agent.Agent] or [`object`][object].
+        """
+        mro = cls.mro()
+        base_index = mro.index(Agent)
+        mro = mro[:base_index]
+        return tuple(f'{t.__module__}.{t.__qualname__}' for t in mro)
+
+    async def on_setup(self) -> None:
+        """Callback invoked at the end of an agent's setup sequence.
+
+        See [`Runtime.run()`][academy.runtime.Runtime.run] for more
+        details on the setup sequence.
+        """
+        pass
+
+    async def on_shutdown(self) -> None:
+        """Callback invoked at the beginning of an agent's shutdown sequence.
+
+        See [`Runtime.run()`][academy.runtime.Runtime.run] for more
+        details on the shutdown sequence.
+        """
+        pass
+
+
+class Action(Generic[P, R_co], Protocol):
+    """Action method protocol."""
+
+    _agent_method_type: Literal['action']
+    _action_method_context: bool
+
+    async def __call__(self, *arg: P.args, **kwargs: P.kwargs) -> R_co:
+        """Expected signature of methods decorated as an action.
+
+        In general, action methods can implement any signature.
+        """
+        ...
+
+
+class ControlLoop(Protocol):
+    """Control loop method protocol."""
+
+    _agent_method_type: Literal['loop']
+
+    async def __call__(self, shutdown: asyncio.Event) -> None:
+        """Expected signature of methods decorated as a control loop.
+
+        Args:
+            shutdown: Event indicating that the agent has been instructed to
+                shutdown and all control loops should exit.
+
+        Returns:
+            Control loops should not return anything.
+        """
+        ...
+
+
+@functools.lru_cache(maxsize=1)
+def _get_handle_protected_methods() -> tuple[str, ...]:
+    methods: list[str] = []
+    for name, value in inspect.getmembers(Handle):
+        # Only include functions defined on Handle, not inherited ones
+        if inspect.isfunction(value) and name in Handle.__dict__:
+            methods.append(name)
+    return tuple(methods)
+
+
+@overload
+def action(method: ActionMethod[P, R]) -> ActionMethod[P, R]: ...
+
+
+@overload
+def action(
+    *,
+    allow_protected_name: bool = False,
+    context: bool = False,
+) -> Callable[[ActionMethod[P, R]], ActionMethod[P, R]]: ...
+
+
+def action(
+    method: ActionMethod[P, R] | None = None,
+    *,
+    allow_protected_name: bool = False,
+    context: bool = False,
+) -> ActionMethod[P, R] | Callable[[ActionMethod[P, R]], ActionMethod[P, R]]:
+    """Decorator that annotates a method of a agent as an action.
+
+    Marking a method of a agent as an action makes the method available
+    to other agents. I.e., peers within a multi-agent system can only invoke
+    methods marked as actions on each other. This enables agents to
+    define "private" methods.
+
+    Example:
+        ```python
+        from academy.agent import Agent, action
+        from academy.context import ActionContext
+
+        class Example(Agent):
+            @action
+            async def perform(self) -> ...:
+                ...
+
+            @action(context=True)
+            async def perform_with_ctx(self, *, context: ActionContext) -> ...:
+                ...
+        ```
+
+    Warning:
+        A warning will be emitted if the decorated method's name clashed
+        with a method of [`Handle`][academy.handle.Handle] because it would
+        not be possible to invoke this action remotely via attribute
+        lookup on a handle. This warning can be suppressed with
+        `allow_protected_name=True`, and the action must be invoked via
+        [`Handle.action()`][academy.handle.Handle.action].
+
+    Args:
+        method: Method to decorate as an action.
+        allow_protected_name: Allow decorating a method as an action when
+            the name of the method clashes with a protected method name of
+            [`Handle`][academy.handle.Handle]. This flag silences the
+            emitted warning.
+        context: Specify that the action method expects a context argument.
+            The `context` will be provided at runtime as a keyword argument.
+
+    Raises:
+        TypeError: If `context=True` and the method does not have a parameter
+            named `context` or if `context` is a positional only argument.
+    """
+
+    def decorator(method_: ActionMethod[P, R]) -> ActionMethod[P, R]:
+        if (
+            not allow_protected_name
+            and method_.__name__ in _get_handle_protected_methods()
+        ):
+            warnings.warn(
+                f'The name of the decorated method is "{method_.__name__}" '
+                'which clashes with a protected method of Handle. '
+                'Rename the decorated method to avoid ambiguity when remotely '
+                'invoking it via a handle.',
+                UserWarning,
+                stacklevel=3,
+            )
+        # Typing the requirement that if context=True then params P should
+        # contain a keyword argument named "context" is not easily annotated
+        # for mypy so instead we check at runtime.
+        if context:
+            sig = inspect.signature(method_)
+            if 'context' not in sig.parameters:
+                raise TypeError(
+                    f'Action method "{method_.__name__}" must accept a '
+                    '"context" keyword argument when used with '
+                    '@action(context=True).',
+                )
+            if (
+                sig.parameters['context'].kind
+                != inspect.Parameter.KEYWORD_ONLY
+            ):
+                raise TypeError(
+                    'The "context" argument to action method '
+                    f'"{method_.__name__}" must be a keyword only argument.',
+                )
+
+        method_._agent_method_type = 'action'  # type: ignore[attr-defined]
+        method_._action_method_context = context  # type: ignore[attr-defined]
+        return method_
+
+    if method is None:
+        return decorator
+    else:
+        return decorator(method)
+
+
+def loop(method: LoopMethod[AgentT]) -> LoopMethod[AgentT]:
+    """Decorator that annotates a method of a agent as a control loop.
+
+    Control loop methods of a agent are run as threads when an agent
+    starts. A control loop can run for a well-defined period of time or
+    indefinitely, provided the control loop exits when the `shutdown`
+    event, passed as a parameter to all control loop methods, is set.
+
+    Example:
+        ```python
+        import asyncio
+        from academy.agent import Agent, loop
+
+        class Example(Agent):
+            @loop
+            async def listen(self, shutdown: asyncio.Event) -> None:
+                while not shutdown.is_set():
+                    ...
+        ```
+
+    Raises:
+        TypeError: if the method signature does not conform to the
+            [`ControlLoop`][academy.agent.ControlLoop] protocol.
+    """
+    method._agent_method_type = 'loop'  # type: ignore[attr-defined]
+
+    if sys.version_info >= (3, 10):  # pragma: >=3.10 cover
+        found_sig = inspect.signature(method, eval_str=True)
+        expected_sig = inspect.signature(ControlLoop.__call__, eval_str=True)
+    else:  # pragma: <3.10 cover
+        found_sig = inspect.signature(method)
+        expected_sig = inspect.signature(ControlLoop.__call__)
+
+    if found_sig != expected_sig:
+        raise TypeError(
+            f'Signature of loop method "{method.__name__}" is {found_sig} '
+            f'but should be {expected_sig}. If the signatures look the same '
+            'except that types are stringified, try importing '
+            '"from __future__ import annotations" at the top of the module '
+            'where the agent is defined.',
+        )
+
+    @functools.wraps(method)
+    async def _wrapped(self: AgentT, shutdown: asyncio.Event) -> None:
+        logger.debug('Started %r loop for %s', method.__name__, self)
+        await method(self, shutdown)
+        logger.debug('Exited %r loop for %s', method.__name__, self)
+
+    return _wrapped
+
+
+def event(
+    name: str,
+) -> Callable[
+    [Callable[[AgentT], Coroutine[None, None, None]]],
+    LoopMethod[AgentT],
+]:
+    """Decorator that annotates a method of a agent as an event loop.
+
+    An event loop is a special type of control loop that runs when a
+    [`asyncio.Event`][asyncio.Event] is set. The event is cleared
+    after the loop runs.
+
+    Example:
+        ```python
+        import asyncio
+        from academy.agent import Agent, timer
+
+        class Example(Agent):
+            def __init__(self) -> None:
+                self.alert = asyncio.Event()
+
+            @event('alert')
+            async def handle(self) -> None:
+                # Runs every time alter is set
+                ...
+        ```
+
+    Args:
+        name: Attribute name of the [`asyncio.Event`][asyncio.Event]
+            to wait on.
+
+    Raises:
+        AttributeError: Raised at runtime if no attribute named `name`
+            exists on the agent.
+        TypeError: Raised at runtime if the attribute named `name` is not
+            a [`asyncio.Event`][asyncio.Event].
+    """
+
+    def decorator(
+        method: Callable[[AgentT], Coroutine[None, None, None]],
+    ) -> LoopMethod[AgentT]:
+        method._agent_method_type = 'loop'  # type: ignore[attr-defined]
+
+        @functools.wraps(method)
+        async def _wrapped(self: AgentT, shutdown: asyncio.Event) -> None:
+            event = getattr(self, name)
+            if not isinstance(event, asyncio.Event):
+                raise TypeError(
+                    f'Attribute {name} of {type(self).__class__} has type '
+                    f'{type(event).__class__}. Expected threading.Event.',
+                )
+
+            logger.debug(
+                'Started %r event loop for %s (event: %r)',
+                method.__name__,
+                self,
+                name,
+            )
+            while not shutdown.is_set():
+                await wait_event_async(shutdown, event)
+                if event.is_set():
+                    try:
+                        await method(self)
+                    finally:
+                        event.clear()
+            logger.debug('Exited %r event loop for %s', method.__name__, self)
+
+        return _wrapped
+
+    return decorator
+
+
+def timer(
+    interval: float | timedelta,
+) -> Callable[
+    [Callable[[AgentT], Coroutine[None, None, None]]],
+    LoopMethod[AgentT],
+]:
+    """Decorator that annotates a method of a agent as a timer loop.
+
+    A timer loop is a special type of control loop that runs at a set
+    interval. The method will always be called once before the first
+    sleep.
+
+    Example:
+        ```python
+        from academy.agent import Agent, timer
+
+        class Example(Agent):
+            @timer(interval=1)
+            async def listen(self) -> None:
+                # Runs every 1 second
+                ...
+        ```
+
+    Args:
+        interval: Seconds or a [`timedelta`][datetime.timedelta] to wait
+            between invoking the method.
+    """
+    interval = (
+        interval.total_seconds()
+        if isinstance(interval, timedelta)
+        else interval
+    )
+
+    def decorator(
+        method: Callable[[AgentT], Coroutine[None, None, None]],
+    ) -> LoopMethod[AgentT]:
+        method._agent_method_type = 'loop'  # type: ignore[attr-defined]
+
+        @functools.wraps(method)
+        async def _wrapped(self: AgentT, shutdown: asyncio.Event) -> None:
+            logger.debug(
+                'Started %r timer loop for %s (interval: %fs)',
+                method.__name__,
+                self,
+                interval,
+            )
+            while not shutdown.is_set():
+                try:
+                    await asyncio.wait_for(shutdown.wait(), timeout=interval)
+                except asyncio.TimeoutError:
+                    await method(self)
+            logger.debug('Exited %r timer loop for %s', method.__name__, self)
+
+        return _wrapped
+
+    return decorator
+
+
+def _is_agent_method_type(obj: Any, kind: str) -> bool:
+    return (
+        callable(obj)
+        and hasattr(obj, '_agent_method_type')
+        and obj._agent_method_type == kind
+    )
