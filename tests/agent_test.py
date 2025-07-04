@@ -77,45 +77,45 @@ async def test_agent_context_initialized_error() -> None:
 @pytest.mark.asyncio
 async def test_agent_empty() -> None:
     agent = EmptyAgent()
-    await agent.on_setup()
+    await agent.agent_on_startup()
 
     assert isinstance(agent, EmptyAgent)
     assert isinstance(str(agent), str)
     assert isinstance(repr(agent), str)
 
-    assert len(agent.agent_actions()) == 0
-    assert len(agent.agent_loops()) == 0
-    assert len(agent.agent_handles()) == 0
+    assert len(agent._agent_actions()) == 0
+    assert len(agent._agent_loops()) == 0
+    assert len(agent._agent_handles()) == 0
 
-    await agent.on_shutdown()
+    await agent.agent_on_shutdown()
 
 
 @pytest.mark.asyncio
 async def test_agent_actions() -> None:
     agent = IdentityAgent()
-    await agent.on_setup()
+    await agent.agent_on_startup()
 
-    actions = agent.agent_actions()
+    actions = agent._agent_actions()
     assert set(actions) == {'identity'}
 
     assert await agent.identity(1) == 1
 
-    await agent.on_shutdown()
+    await agent.agent_on_shutdown()
 
 
 @pytest.mark.asyncio
 async def test_agent_loops() -> None:
     agent = WaitAgent()
-    await agent.on_setup()
+    await agent.agent_on_startup()
 
-    loops = agent.agent_loops()
+    loops = agent._agent_loops()
     assert set(loops) == {'wait'}
 
     shutdown = asyncio.Event()
     shutdown.set()
     await agent.wait(shutdown)
 
-    await agent.on_shutdown()
+    await agent.agent_on_shutdown()
 
 
 @pytest.mark.asyncio
@@ -138,7 +138,7 @@ async def test_agent_event() -> None:
 
     agent = _Event()
 
-    loops = agent.agent_loops()
+    loops = agent._agent_loops()
     assert set(loops) == {'bad_event', 'missing_event', 'run'}
 
     shutdown = asyncio.Event()
@@ -172,7 +172,7 @@ async def test_agent_timer() -> None:
 
     agent = _Timer()
 
-    loops = agent.agent_loops()
+    loops = agent._agent_loops()
     assert set(loops) == {'counter'}
 
     shutdown = asyncio.Event()
@@ -196,7 +196,7 @@ def test_agent_action_decorator_usage_ok() -> None:
         async def action3(self, *, context: ActionContext) -> None: ...
 
     agent = _TestAgent()
-    assert len(agent.agent_actions()) == 3  # noqa: PLR2004
+    assert len(agent._agent_actions()) == 3  # noqa: PLR2004
 
 
 def test_agent_action_decorator_usage_error() -> None:
@@ -253,12 +253,12 @@ def test_agent_action_decorator_name_clash_error() -> None:
 async def test_agent_handles() -> None:
     handle = ProxyHandle(EmptyAgent())
     agent = HandleAgent(handle)
-    await agent.on_setup()
+    await agent.agent_on_startup()
 
-    handles = agent.agent_handles()
+    handles = agent._agent_handles()
     assert set(handles) == {'handle'}
 
-    await agent.on_shutdown()
+    await agent.agent_on_shutdown()
 
 
 class A(Agent): ...
@@ -274,11 +274,11 @@ class D(A, B): ...
 
 
 def test_agent_mro() -> None:
-    assert Agent.agent_mro() == ()
-    assert A.agent_mro() == (f'{__name__}.A',)
-    assert B.agent_mro() == (f'{__name__}.B',)
-    assert C.agent_mro() == (f'{__name__}.C', f'{__name__}.A')
-    assert D.agent_mro() == (
+    assert Agent._agent_mro() == ()
+    assert A._agent_mro() == (f'{__name__}.A',)
+    assert B._agent_mro() == (f'{__name__}.B',)
+    assert C._agent_mro() == (f'{__name__}.C', f'{__name__}.A')
+    assert D._agent_mro() == (
         f'{__name__}.D',
         f'{__name__}.A',
         f'{__name__}.B',

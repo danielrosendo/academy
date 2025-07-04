@@ -64,8 +64,8 @@ class Agent:
 
     An agent is composed of three parts:
 
-    1. The [`on_startup()`][academy.agent.Agent.on_setup] and
-       [`on_shutdown()`][academy.agent.Agent.on_shutdown] methods
+    1. The [`agent_on_startup()`][academy.agent.Agent.agent_on_startup] and
+       [`agent_on_shutdown()`][academy.agent.Agent.agent_on_shutdown] methods
        define callbacks that are invoked once at the start and end of an
        agent's execution, respectively. The methods should be used to
        initialize and cleanup stateful resources. Resource initialization
@@ -140,15 +140,6 @@ class Agent:
         """
         return self.agent_context.exchange_client
 
-    def agent_shutdown(self) -> None:
-        """Request the agent to shutdown.
-
-        Raises:
-            AgentNotInitializedError: If the agent runtime implementing
-                this agent has not been started.
-        """
-        self.agent_context.shutdown_event.set()
-
     def _agent_attributes(self) -> Generator[tuple[str, Any]]:
         for name in dir(self):
             if name in Agent.__dict__:
@@ -159,7 +150,7 @@ class Agent:
             attr = getattr(self, name)
             yield name, attr
 
-    def agent_actions(self) -> dict[str, Action[Any, Any]]:
+    def _agent_actions(self) -> dict[str, Action[Any, Any]]:
         """Get methods of this agent type that are decorated as actions.
 
         Returns:
@@ -171,7 +162,7 @@ class Agent:
                 actions[name] = attr
         return actions
 
-    def agent_loops(self) -> dict[str, ControlLoop]:
+    def _agent_loops(self) -> dict[str, ControlLoop]:
         """Get methods of this agent type that are decorated as loops.
 
         Returns:
@@ -183,7 +174,7 @@ class Agent:
                 loops[name] = attr
         return loops
 
-    def agent_handles(
+    def _agent_handles(
         self,
     ) -> dict[
         str,
@@ -212,7 +203,7 @@ class Agent:
         return handles
 
     @classmethod
-    def agent_mro(cls) -> tuple[str, ...]:
+    def _agent_mro(cls) -> tuple[str, ...]:
         """Get the method resolution order of the agent.
 
         Example:
@@ -224,13 +215,13 @@ class Agent:
             >>> class C(A): ...
             >>> class D(A, B): ...
             >>>
-            >>> A.agent_mro()
+            >>> A._agent_mro()
             ('__main__.A',)
-            >>> B.agent_mro()
+            >>> B._agent_mro()
             ('__main__.B',)
-            >>> C.agent_mro()
+            >>> C._agent_mro()
             ('__main__.C', '__main__.A')
-            >>> D.agent_mro()
+            >>> D._agent_mro()
             ('__main__.D', '__main__.A', '__main__.B')
             ```
 
@@ -244,21 +235,30 @@ class Agent:
         mro = mro[:base_index]
         return tuple(f'{t.__module__}.{t.__qualname__}' for t in mro)
 
-    async def on_setup(self) -> None:
-        """Callback invoked at the end of an agent's setup sequence.
+    async def agent_on_startup(self) -> None:
+        """Callback invoked at the end of an agent's startup sequence.
 
         See [`Runtime.run()`][academy.runtime.Runtime.run] for more
-        details on the setup sequence.
+        details on the startup sequence.
         """
         pass
 
-    async def on_shutdown(self) -> None:
+    async def agent_on_shutdown(self) -> None:
         """Callback invoked at the beginning of an agent's shutdown sequence.
 
         See [`Runtime.run()`][academy.runtime.Runtime.run] for more
         details on the shutdown sequence.
         """
         pass
+
+    def agent_shutdown(self) -> None:
+        """Request the agent to shutdown.
+
+        Raises:
+            AgentNotInitializedError: If the agent runtime implementing
+                this agent has not been started.
+        """
+        self.agent_context.shutdown_event.set()
 
 
 class Action(Generic[P, R_co], Protocol):
