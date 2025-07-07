@@ -19,7 +19,7 @@ from aiohttp.web import Request
 from academy.exception import BadEntityIdError
 from academy.exception import MailboxTerminatedError
 from academy.exchange import MailboxStatus
-from academy.exchange.cloud.client import HttpExchangeFactory
+from academy.exchange.cloud import HttpExchangeFactory
 from academy.exchange.cloud.config import ExchangeAuthConfig
 from academy.exchange.cloud.config import ExchangeServingConfig
 from academy.exchange.cloud.exceptions import ForbiddenError
@@ -71,9 +71,7 @@ def test_server_run() -> None:
     while True:
         try:
             client = HttpExchangeFactory(
-                config.host,
-                config.port,
-                scheme='http',
+                f'http://{config.host}:{config.port}/',
             ).create_user_client()
         except OSError:  # pragma: no cover
             time.sleep(0.01)
@@ -102,9 +100,7 @@ def test_server_run_ssl(ssl_context: SSLContextFixture) -> None:
     while True:
         try:
             client = HttpExchangeFactory(
-                config.host,
-                config.port,
-                scheme='https',
+                f'https://{config.host}:{config.port}/',
                 ssl_verify=False,
             ).create_user_client()
         except OSError:  # pragma: no cover
