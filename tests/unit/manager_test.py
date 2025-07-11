@@ -14,8 +14,8 @@ from academy.manager import Manager
 from testing.agents import EmptyAgent
 from testing.agents import SleepAgent
 from testing.constant import TEST_CONNECTION_TIMEOUT
-from testing.constant import TEST_LOOP_SLEEP
-from testing.constant import TEST_THREAD_JOIN_TIMEOUT
+from testing.constant import TEST_SLEEP_INTERVAL
+from testing.constant import TEST_WAIT_TIMEOUT
 
 
 @pytest.mark.asyncio
@@ -33,12 +33,12 @@ async def test_launch_and_shutdown(
     manager: Manager[LocalExchangeTransport],
 ) -> None:
     # Two ways to launch: agent instance or deferred agent initialization
-    handle1 = await manager.launch(SleepAgent(TEST_LOOP_SLEEP))
-    handle2 = await manager.launch(SleepAgent, args=(TEST_LOOP_SLEEP,))
+    handle1 = await manager.launch(SleepAgent(TEST_SLEEP_INTERVAL))
+    handle2 = await manager.launch(SleepAgent, args=(TEST_SLEEP_INTERVAL,))
 
     assert len(manager.running()) == 2  # noqa: PLR2004
 
-    await asyncio.sleep(5 * TEST_LOOP_SLEEP)
+    await asyncio.sleep(5 * TEST_SLEEP_INTERVAL)
 
     await manager.shutdown(handle1.agent_id)
     await manager.shutdown(handle2)
@@ -56,11 +56,11 @@ async def test_launch_and_shutdown(
 async def test_shutdown_on_exit(
     manager: Manager[LocalExchangeTransport],
 ) -> None:
-    agent = SleepAgent(TEST_LOOP_SLEEP)
+    agent = SleepAgent(TEST_SLEEP_INTERVAL)
     # The manager fixture uses a context manager that when exited should
     # shutdown this agent and wait on it
     await manager.launch(agent)
-    await asyncio.sleep(5 * TEST_LOOP_SLEEP)
+    await asyncio.sleep(5 * TEST_SLEEP_INTERVAL)
     assert len(manager.running()) == 1
 
 
@@ -84,24 +84,24 @@ async def test_wait_bad_identifier(
 async def test_wait_timeout(
     manager: Manager[LocalExchangeTransport],
 ) -> None:
-    agent = SleepAgent(TEST_LOOP_SLEEP)
+    agent = SleepAgent(TEST_SLEEP_INTERVAL)
     handle = await manager.launch(agent)
     with pytest.raises(TimeoutError):
-        await manager.wait({handle}, timeout=TEST_LOOP_SLEEP)
+        await manager.wait({handle}, timeout=TEST_SLEEP_INTERVAL)
 
 
 @pytest.mark.asyncio
 async def test_wait_timeout_all_completed(
     manager: Manager[LocalExchangeTransport],
 ) -> None:
-    agent = SleepAgent(TEST_LOOP_SLEEP)
+    agent = SleepAgent(TEST_SLEEP_INTERVAL)
     handle1 = await manager.launch(agent)
     handle2 = await manager.launch(agent)
     await manager.shutdown(handle1, blocking=True)
     with pytest.raises(TimeoutError):
         await manager.wait(
             {handle1, handle2},
-            timeout=TEST_LOOP_SLEEP,
+            timeout=TEST_SLEEP_INTERVAL,
             return_when=asyncio.ALL_COMPLETED,
         )
 
@@ -133,17 +133,17 @@ async def test_duplicate_launched_agents_error(
 async def test_shutdown_nonblocking(
     manager: Manager[LocalExchangeTransport],
 ) -> None:
-    agent = SleepAgent(TEST_LOOP_SLEEP)
+    agent = SleepAgent(TEST_SLEEP_INTERVAL)
     handle = await manager.launch(agent)
     await manager.shutdown(handle, blocking=False)
-    await manager.wait({handle}, timeout=TEST_THREAD_JOIN_TIMEOUT)
+    await manager.wait({handle}, timeout=TEST_WAIT_TIMEOUT)
 
 
 @pytest.mark.asyncio
 async def test_shutdown_blocking(
     manager: Manager[LocalExchangeTransport],
 ) -> None:
-    agent = SleepAgent(TEST_LOOP_SLEEP)
+    agent = SleepAgent(TEST_SLEEP_INTERVAL)
     handle = await manager.launch(agent)
     await manager.shutdown(handle, blocking=True)
     assert len(manager.running()) == 0
@@ -151,11 +151,11 @@ async def test_shutdown_blocking(
 
 @pytest.mark.asyncio
 async def test_bad_default_executor(
-    exchange: UserExchangeClient[LocalExchangeTransport],
+    exchange_client: UserExchangeClient[LocalExchangeTransport],
 ) -> None:
     with pytest.raises(ValueError, match='No executor named "second"'):
         Manager(
-            exchange_client=exchange,
+            exchange_client=exchange_client,
             executors={'first': ThreadPoolExecutor()},
             default_executor='second',
         )
@@ -163,11 +163,11 @@ async def test_bad_default_executor(
 
 @pytest.mark.asyncio
 async def test_add_and_set_executor_errors(
-    exchange: UserExchangeClient[LocalExchangeTransport],
+    exchange_client: UserExchangeClient[LocalExchangeTransport],
 ) -> None:
     executor = ThreadPoolExecutor()
     async with Manager(
-        exchange_client=exchange,
+        exchange_client=exchange_client,
         executors={'first': executor},
     ) as manager:
         with pytest.raises(
@@ -184,10 +184,10 @@ async def test_add_and_set_executor_errors(
 
 @pytest.mark.asyncio
 async def test_multiple_executor(
-    exchange: UserExchangeClient[LocalExchangeTransport],
+    exchange_client: UserExchangeClient[LocalExchangeTransport],
 ) -> None:
     async with Manager(
-        exchange_client=exchange,
+        exchange_client=exchange_client,
         executors={'first': ThreadPoolExecutor()},
     ) as manager:
         await manager.launch(EmptyAgent(), executor='first')
@@ -200,10 +200,10 @@ async def test_multiple_executor(
 
 @pytest.mark.asyncio
 async def test_multiple_executor_no_default(
-    exchange: UserExchangeClient[LocalExchangeTransport],
+    exchange_client: UserExchangeClient[LocalExchangeTransport],
 ) -> None:
     async with Manager(
-        exchange_client=exchange,
+        exchange_client=exchange_client,
         executors={'first': ThreadPoolExecutor()},
     ) as manager:
         with pytest.raises(ValueError, match='no default is set.'):
@@ -223,13 +223,17 @@ class FailOnStartupAgent(Agent):
 
 @pytest.mark.asyncio
 async def test_retry_on_error(
-    exchange: UserExchangeClient[LocalExchangeTransport],
+    exchange_client: UserExchangeClient[LocalExchangeTransport],
 ) -> None:
     # Note: this test presently relies on agent to be shared across
     # each agent execution in other threads.
     agent = FailOnStartupAgent(max_errors=2)
     executor = ThreadPoolExecutor(max_workers=1)
-    async with Manager(exchange, executors=executor, max_retries=3) as manager:
+    async with Manager(
+        exchange_client,
+        executors=executor,
+        max_retries=3,
+    ) as manager:
         handle = await manager.launch(agent)
         await handle.ping(timeout=TEST_CONNECTION_TIMEOUT)
         assert agent.errors == 2  # noqa: PLR2004
@@ -240,10 +244,13 @@ async def test_retry_on_error(
 @pytest.mark.asyncio
 async def test_wait_ignore_agent_errors(
     raise_error: bool,
-    exchange: UserExchangeClient[LocalExchangeTransport],
+    exchange_client: UserExchangeClient[LocalExchangeTransport],
 ) -> None:
     agent = FailOnStartupAgent()
-    manager = Manager(exchange, executors=ThreadPoolExecutor(max_workers=1))
+    manager = Manager(
+        exchange_client,
+        executors=ThreadPoolExecutor(max_workers=1),
+    )
     handle = await manager.launch(agent)
 
     if raise_error:
@@ -258,11 +265,11 @@ async def test_wait_ignore_agent_errors(
 
 @pytest.mark.asyncio
 async def test_warn_executor_overload(
-    exchange: UserExchangeClient[LocalExchangeTransport],
+    exchange_client: UserExchangeClient[LocalExchangeTransport],
 ) -> None:
-    agent = SleepAgent(TEST_LOOP_SLEEP)
+    agent = SleepAgent(TEST_SLEEP_INTERVAL)
     async with Manager(
-        exchange,
+        exchange_client,
         executors=ThreadPoolExecutor(max_workers=1),
     ) as manager:
         await manager.launch(agent)

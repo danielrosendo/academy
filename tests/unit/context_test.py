@@ -6,6 +6,7 @@ import pytest
 
 from academy.context import ActionContext
 from academy.exchange import UserExchangeClient
+from academy.exchange.local import LocalExchangeTransport
 from academy.identifier import AgentId
 from academy.identifier import UserId
 from testing.agents import EmptyAgent
@@ -13,11 +14,11 @@ from testing.agents import EmptyAgent
 
 @pytest.mark.asyncio
 async def test_action_context_agent_source(
-    exchange: UserExchangeClient[Any],
+    exchange_client: UserExchangeClient[LocalExchangeTransport],
 ) -> None:
-    factory = exchange.factory()
+    factory = exchange_client.factory()
     source_id: AgentId[EmptyAgent] = AgentId.new()
-    registration = await exchange.register_agent(EmptyAgent)
+    registration = await exchange_client.register_agent(EmptyAgent)
 
     async def _request_handler(_: Any) -> None:  # pragma: no cover
         pass
@@ -37,11 +38,11 @@ async def test_action_context_agent_source(
 
 @pytest.mark.asyncio
 async def test_action_context_user_source(
-    exchange: UserExchangeClient[Any],
+    exchange_client: UserExchangeClient[LocalExchangeTransport],
 ) -> None:
-    factory = exchange.factory()
+    factory = exchange_client.factory()
     source_id = UserId.new()
-    registration = await exchange.register_agent(EmptyAgent)
+    registration = await exchange_client.register_agent(EmptyAgent)
 
     async def _request_handler(_: Any) -> None:  # pragma: no cover
         pass
