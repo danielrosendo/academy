@@ -93,6 +93,7 @@ class Agent:
 
     def __init__(self) -> None:
         self.__agent_context: AgentContext[Self] | None = None
+        self.__agent_run_sync_semaphore: asyncio.Semaphore | None = None
 
     def __repr__(self) -> str:
         return f'{type(self).__name__}()'
@@ -270,6 +271,78 @@ class Agent:
         for more details on the shutdown sequence.
         """
         pass
+
+    async def agent_run_sync(
+        self,
+        function: Callable[P, R],
+        /,
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> R:
+        """Run a blocking function in separate thread.
+
+        Example:
+            ```python
+            import time
+            from academy.agent import Agent, action
+
+            class Example(Agent):
+                def blocking_call(self, value: int) -> int:
+                    time.sleep(10)
+                    return value
+
+                @action
+                async def non_blocking_call(self, value: int) -> int:
+                    result = await self.agent_run_sync(self.blocking_call, value)
+                    ...
+                    return result
+            ```
+
+        Note:
+            The max concurrency of the executor is configured in the
+            [`RuntimeConfig`][academy.runtime.RuntimeConfig]. If all
+            executor workers are busy the function will be queued and a
+            warning will be logged.
+
+        Warning:
+           This function does not support cancellation. For example, if you
+           wrap this call in [`asyncio.wait_for()`][asyncio.wait_for] and a
+           timeout occurs, the task wrapping the coroutine will be cancelled
+           but the blocking function will continue running in its thread until
+           completion.
+
+        Args:
+            function: The blocking function to run.
+            *args: Positional arguments for the function.
+            **kwargs: Keyword arguments for the function.
+
+        Returns:
+            The result of the function call.
+
+        Raises:
+            AgentNotInitializedError: If the agent runtime has not been
+                started.
+            Exception: Any exception raised by the function.
+        """  # noqa: E501
+        executor = self.agent_context.executor
+
+        wrapped = functools.partial(function, *args, **kwargs)
+        loop = asyncio.get_running_loop()
+
+        if self.__agent_run_sync_semaphore is None:
+            max_workers = executor._max_workers
+            self.__agent_run_sync_semaphore = asyncio.Semaphore(max_workers)
+
+        acquired = self.__agent_run_sync_semaphore.locked()
+        if acquired:
+            logger.warning(
+                f'Thread-pool executor for {self.agent_id} is overloaded, '
+                f'sync function "{function.__name__}" is waiting for a '
+                'worker',
+            )
+
+        async with self.__agent_run_sync_semaphore:
+            return await loop.run_in_executor(executor, wrapped)
 
     def agent_shutdown(self) -> None:
         """Request the agent to shutdown.
@@ -528,7 +601,7 @@ def event(
             if not isinstance(event, asyncio.Event):
                 raise TypeError(
                     f'Attribute {name} of {type(self).__class__} has type '
-                    f'{type(event).__class__}. Expected threading.Event.',
+                    f'{type(event).__class__}. Expected asyncio.Event.',
                 )
 
             logger.debug(

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
@@ -16,6 +19,7 @@ from academy.exception import AgentNotInitializedError
 from academy.exchange import UserExchangeClient
 from academy.exchange.local import LocalExchangeTransport
 from academy.handle import ProxyHandle
+from academy.identifier import AgentId
 from testing.agents import EmptyAgent
 from testing.agents import HandleAgent
 from testing.agents import IdentityAgent
@@ -48,6 +52,7 @@ async def test_agent_context_initialized_ok(
         context = AgentContext(
             agent_id=client.client_id,
             exchange_client=client,
+            executor=None,  # type: ignore[arg-type]
             shutdown_event=asyncio.Event(),
         )
         agent._agent_set_context(context)
@@ -72,6 +77,52 @@ async def test_agent_context_initialized_error() -> None:
         _ = agent.agent_exchange_client
     with pytest.raises(AgentNotInitializedError):
         agent.agent_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_agent_run_sync() -> None:
+    class SyncAgent(Agent):
+        def add_sync(self, a: int, b: int) -> int:
+            return a + b
+
+        async def add_async(self, a: int, b: int) -> int:
+            return await self.agent_run_sync(self.add_sync, a, b)
+
+    agent = SyncAgent()
+    with ThreadPoolExecutor() as executor:
+        context: AgentContext[SyncAgent] = AgentContext(
+            agent_id=AgentId.new(),
+            exchange_client=None,  # type: ignore[arg-type]
+            executor=executor,
+            shutdown_event=asyncio.Event(),
+        )
+        agent._agent_set_context(context)
+
+        assert await agent.add_async(0, 1) == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_run_sync_overloaded_warning(caplog) -> None:
+    agent = EmptyAgent()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        context: AgentContext[EmptyAgent] = AgentContext(
+            agent_id=AgentId.new(),
+            exchange_client=None,  # type: ignore[arg-type]
+            executor=executor,
+            shutdown_event=asyncio.Event(),
+        )
+        agent._agent_set_context(context)
+
+        with caplog.at_level(logging.WARNING):
+            tasks = tuple(
+                asyncio.create_task(
+                    agent.agent_run_sync(time.sleep, TEST_SLEEP_INTERVAL),
+                )
+                for _ in range(8)
+            )
+            await asyncio.wait(tasks)
+
+        assert 'sync function "sleep" is waiting for a worker' in caplog.text
 
 
 @pytest.mark.asyncio
