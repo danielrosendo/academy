@@ -1,13 +1,4 @@
-## Release Timeline
-
-Releases are created on an as-needed basis.
-
-## Versioning
-
-Academy uses [semver](https://semver.org/) as its versioning system.
-While Academy is in major version zero (0.y.z), breaking changes will be released in minor version updates.
-
-## Creating Releases
+# Release Guide
 
 1. Choose the next version number, referred to as `{VERSION}` for the
    rest of the instructions. Versioning follows semver

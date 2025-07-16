@@ -1,4 +1,5 @@
-# Guides
+# Guides, Integrations, and Tutorials
 
-<!-- Links are relative to file -->
-- [Migrating Versions](migrating.md)
+!!! note
+
+    Coming soon!
