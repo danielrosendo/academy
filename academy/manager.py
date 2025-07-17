@@ -26,6 +26,7 @@ from academy.exchange import ExchangeFactory
 from academy.exchange import UserExchangeClient
 from academy.exchange.transport import AgentRegistration
 from academy.exchange.transport import ExchangeTransportT
+from academy.handle import exchange_context
 from academy.handle import RemoteHandle
 from academy.identifier import AgentId
 from academy.identifier import UserId
@@ -154,6 +155,9 @@ class Manager(Generic[ExchangeTransportT], NoPickleMixin):
         logger.info('Initialized manager (%s)', self.user_id)
 
     async def __aenter__(self) -> Self:
+        self.exchange_context_token = exchange_context.set(
+            self.exchange_client,
+        )
         return self
 
     async def __aexit__(
@@ -163,6 +167,7 @@ class Manager(Generic[ExchangeTransportT], NoPickleMixin):
         exc_traceback: TracebackType | None,
     ) -> None:
         await self.close()
+        exchange_context.reset(self.exchange_context_token)
 
     def __repr__(self) -> str:
         executors_repr = ', '.join(
@@ -441,7 +446,7 @@ class Manager(Generic[ExchangeTransportT], NoPickleMixin):
         handle = self._handles.get(agent_id, None)
         if handle is not None and not handle.closed():
             return handle
-        handle = self.exchange_client.get_handle(agent_id)
+        handle = RemoteHandle(agent_id)
         self._handles[agent_id] = handle
         return handle
 
