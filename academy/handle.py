@@ -6,34 +6,24 @@ import logging
 import sys
 import time
 import uuid
-from collections.abc import Iterable
-from collections.abc import Mapping
 from contextvars import ContextVar
-from types import TracebackType
+from pickle import PicklingError
 from typing import Any
 from typing import Generic
 from typing import Protocol
 from typing import runtime_checkable
 from typing import TYPE_CHECKING
 from typing import TypeVar
+from weakref import WeakSet
 
 if sys.version_info >= (3, 10):  # pragma: >=3.10 cover
     from typing import ParamSpec
 else:  # pragma: <3.10 cover
     from typing_extensions import ParamSpec
 
-if sys.version_info >= (3, 11):  # pragma: >=3.11 cover
-    from typing import Self
-else:  # pragma: <3.11 cover
-    from typing_extensions import Self
-
 from academy.exception import AgentTerminatedError
 from academy.exception import ExchangeClientNotFoundError
-from academy.exception import HandleClosedError
-from academy.exception import HandleReuseError
 from academy.identifier import AgentId
-from academy.identifier import EntityId
-from academy.identifier import UserId
 from academy.message import ActionRequest
 from academy.message import ActionResponse
 from academy.message import ErrorResponse
@@ -77,11 +67,6 @@ class Handle(Protocol[AgentT]):
         """ID of the agent this is a handle to."""
         ...
 
-    @property
-    def client_id(self) -> EntityId:
-        """ID of the client for this handle."""
-        ...
-
     async def action(self, action: str, /, *args: Any, **kwargs: Any) -> R:
         """Invoke an action on the agent.
 
@@ -98,22 +83,6 @@ class Handle(Protocol[AgentT]):
                 typically indicates the agent shutdown for another reason
                 (it self terminated or via another handle).
             Exception: Any exception raised by the action.
-            HandleClosedError: If the handle was closed.
-        """
-        ...
-
-    async def close(
-        self,
-        wait_futures: bool = True,
-        *,
-        timeout: float | None = None,
-    ) -> None:
-        """Close this handle.
-
-        Args:
-            wait_futures: Wait to return until all pending futures are done
-                executing. If `False`, pending futures are cancelled.
-            timeout: Optional timeout used when `wait=True`.
         """
         ...
 
@@ -134,7 +103,6 @@ class Handle(Protocol[AgentT]):
             AgentTerminatedError: If the agent's mailbox was closed. This
                 typically indicates the agent shutdown for another reason
                 (it self terminated or via another handle).
-            HandleClosedError: If the handle was closed.
             TimeoutError: If the timeout is exceeded.
         """
         ...
@@ -152,45 +120,8 @@ class Handle(Protocol[AgentT]):
             AgentTerminatedError: If the agent's mailbox was closed. This
                 typically indicates the agent shutdown for another reason
                 (it self terminated or via another handle).
-            HandleClosedError: If the handle was closed.
         """
         ...
-
-
-class HandleDict(dict[K, Handle[AgentT]]):
-    """Dictionary mapping keys to handles.
-
-    Tip:
-        The `HandleDict` is required when storing a mapping of handles as
-        attributes of a `Agent` so that those handles get bound to the
-        correct agent when running.
-    """
-
-    def __init__(
-        self,
-        values: Mapping[K, Handle[AgentT]]
-        | Iterable[tuple[K, Handle[AgentT]]] = (),
-        /,
-        **kwargs: dict[str, Handle[AgentT]],
-    ) -> None:
-        super().__init__(values, **kwargs)
-
-
-class HandleList(list[Handle[AgentT]]):
-    """List of handles.
-
-    Tip:
-        The `HandleList` is required when storing a list of handles as
-        attributes of a `Agent` so that those handles get bound to the
-        correct agent when running.
-    """
-
-    def __init__(
-        self,
-        iterable: Iterable[Handle[AgentT]] = (),
-        /,
-    ) -> None:
-        super().__init__(iterable)
 
 
 class ProxyHandle(Generic[AgentT]):
@@ -205,9 +136,7 @@ class ProxyHandle(Generic[AgentT]):
     def __init__(self, agent: AgentT) -> None:
         self.agent = agent
         self.agent_id: AgentId[AgentT] = AgentId.new()
-        self.client_id: EntityId = UserId.new()
         self._agent_closed = False
-        self._handle_closed = False
 
     def __repr__(self) -> str:
         return f'{type(self).__name__}(agent={self.agent!r})'
@@ -244,33 +173,12 @@ class ProxyHandle(Generic[AgentT]):
                 typically indicates the agent shutdown for another reason
                 (it self terminated or via another handle).
             Exception: Any exception raised by the action.
-            HandleClosedError: If the handle was closed.
         """
         if self._agent_closed:
             raise AgentTerminatedError(self.agent_id)
-        elif self._handle_closed:
-            raise HandleClosedError(self.agent_id, self.client_id)
 
         method = getattr(self.agent, action)
         return await method(*args, **kwargs)
-
-    async def close(
-        self,
-        wait_futures: bool = True,
-        *,
-        timeout: float | None = None,
-    ) -> None:
-        """Close this handle.
-
-        Note:
-            This is a no-op for proxy handles.
-
-        Args:
-            wait_futures: Wait to return until all pending futures are done
-                executing. If `False`, pending futures are cancelled.
-            timeout: Optional timeout used when `wait=True`.
-        """
-        self._handle_closed = True
 
     async def ping(self, *, timeout: float | None = None) -> float:
         """Ping the agent.
@@ -292,13 +200,10 @@ class ProxyHandle(Generic[AgentT]):
             AgentTerminatedError: If the agent's mailbox was closed. This
                 typically indicates the agent shutdown for another reason
                 (it self terminated or via another handle).
-            HandleClosedError: If the handle was closed.
             TimeoutError: If the timeout is exceeded.
         """
         if self._agent_closed:
             raise AgentTerminatedError(self.agent_id)
-        elif self._handle_closed:
-            raise HandleClosedError(self.agent_id, self.client_id)
         return 0
 
     async def shutdown(self, *, terminate: bool | None = None) -> None:
@@ -314,55 +219,60 @@ class ProxyHandle(Generic[AgentT]):
             AgentTerminatedError: If the agent's mailbox was closed. This
                 typically indicates the agent shutdown for another reason
                 (it self terminated or via another handle).
-            HandleClosedError: If the handle was closed.
         """
         if self._agent_closed:
             raise AgentTerminatedError(self.agent_id)
-        elif self._handle_closed:
-            raise HandleClosedError(self.agent_id, self.client_id)
         self._agent_closed = True if terminate is None else terminate
 
 
-exchange_context: ContextVar[ExchangeClient[Any] | None] = ContextVar(
+exchange_context: ContextVar[ExchangeClient[Any]] = ContextVar(
     'exchange_context',
-    default=None,
 )
 
 
 class RemoteHandle(Generic[AgentT]):
-    """Handle to a remote agent bound to an exchange client.
+    """Handle to a remote agent.
+
+    By default a remote handle uses the 'exchange_context' ContextVar
+    as the exchange client to send messages. This allows the outgoing
+    mailbox to change depending on the context in which the handle is
+    used. The `exchange` argument is used as the default client when
+    the ContextVar is not set. `ignore_context` will cause the handle
+    to only use the `exchange` argument provided in the initializer no
+    matter the context where the handle is used. This should only be for
+    advanced usage.
 
     Args:
-        exchange: Exchange client used for agent communication.
         agent_id: EntityId of the target agent of this handle.
+        exchange: Exchange client to use to send messages.
+        ignore_context: Ignore exchange client set in context.
     """
 
     def __init__(
         self,
         agent_id: AgentId[AgentT],
+        *,
         exchange: ExchangeClient[Any] | None = None,
+        ignore_context: bool = False,
     ) -> None:
         self.agent_id = agent_id
         self._exchange = exchange
+        self._registered_exchanges: WeakSet[ExchangeClient[Any]] = WeakSet()
+        self.ignore_context = ignore_context
 
-        if (
-            self._exchange is not None
-            and self.agent_id == self._exchange.client_id
-        ):
+        if ignore_context and not exchange:
             raise ValueError(
-                'Cannot create handle to self. The IDs of the exchange '
-                f'client and the target agent are the same: {self.agent_id}.',
+                'Cannot initialize handle with ignore_context=True '
+                'and no explicit exchange.',
             )
 
         # Unique identifier for each handle object; used to disambiguate
         # messages when multiple handles are bound to the same mailbox.
         self.handle_id = uuid.uuid4()
+        self._futures: dict[uuid.UUID, asyncio.Future[Any]] = {}
 
         if self._exchange is not None:
-            self._exchange.register_handle(self)
-
-        self._futures: dict[uuid.UUID, asyncio.Future[Any]] = {}
-        self._closed = False
+            self._register_with_exchange(self._exchange)
 
     @property
     def exchange(self) -> ExchangeClient[Any]:
@@ -375,60 +285,40 @@ class RemoteHandle(Generic[AgentT]):
             HandleNotBoundError: If the exchange client can't be found.
 
         """
-        exchange = exchange_context.get()
-        if self._exchange is not None:
-            if exchange is not None and self._exchange != exchange:
-                raise HandleReuseError(self.agent_id)
+        if self.ignore_context:
+            assert self._exchange is not None
             return self._exchange
 
-        if exchange is None:
-            raise ExchangeClientNotFoundError(self.agent_id)
+        try:
+            return exchange_context.get()
+        except LookupError as e:
+            if self._exchange is not None:
+                return self._exchange
 
-        self._exchange = exchange
-        self._exchange.register_handle(self)
-        return exchange
-
-    @property
-    def client_id(self) -> EntityId:
-        """ID of the client for this handle."""
-        return self.exchange.client_id
-
-    async def __aenter__(self) -> Self:
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        exc_traceback: TracebackType | None,
-    ) -> None:
-        await self.close()
+            raise ExchangeClientNotFoundError(self.agent_id) from e
 
     def __reduce__(
         self,
     ) -> tuple[
         type[RemoteHandle[Any]],
-        tuple[AgentId[AgentT],],
+        tuple[Any, ...],
     ]:
+        if self.ignore_context:
+            raise PicklingError(
+                'Handle with ignore_context=True is not pickle-able',
+            )
         return (RemoteHandle, (self.agent_id,))
 
     def __repr__(self) -> str:
-        try:
-            exchange = self.exchange
-        except ExchangeClientNotFoundError:
-            exchange = None
         return (
             f'{type(self).__name__}(agent_id={self.agent_id!r}, '
-            f'exchange={exchange!r})'
+            f'exchange={self._exchange!r}, '
+            f'ignore_context={self.ignore_context!r})'
         )
 
     def __str__(self) -> str:
         name = type(self).__name__
-        try:
-            client_id = self.client_id
-        except ExchangeClientNotFoundError:
-            client_id = None
-        return f'{name}<agent: {self.agent_id}; mailbox: {client_id}>'
+        return f'{name}<agent: {self.agent_id}>'
 
     def __getattr__(self, name: str) -> Any:
         async def remote_method_call(*args: Any, **kwargs: Any) -> R:
@@ -436,16 +326,9 @@ class RemoteHandle(Generic[AgentT]):
 
         return remote_method_call
 
-    def clone(self) -> RemoteHandle[AgentT]:
-        """Create an unbound copy of this handle."""
-        return RemoteHandle(self.agent_id)
-
     async def _process_response(self, response: Message[Response]) -> None:
-        future = self._futures.pop(response.tag, None)
-        if future is None or future.cancelled():
-            # Response is not associated with any active pending future
-            # so safe to ignore it
-            return
+        future = self._futures[response.tag]
+        assert not future.cancelled()
 
         body = response.get_body()
         if isinstance(body, ActionResponse):
@@ -457,40 +340,17 @@ class RemoteHandle(Generic[AgentT]):
         else:
             raise AssertionError('Unreachable.')
 
-    async def close(
-        self,
-        wait_futures: bool = True,
-        *,
-        timeout: float | None = None,
-    ) -> None:
-        """Close this handle.
+    def _register_with_exchange(self, exchange: ExchangeClient[Any]) -> None:
+        """Register to receive messages from exchange.
 
-        Note:
-            This does not close the exchange client.
+        Typically this will be called internally when sending a message.
 
         Args:
-            wait_futures: Wait to return until all pending futures are done
-                executing. If `False`, pending futures are cancelled.
-            timeout: Optional timeout used when `wait=True`.
+            exchange: Exchange client to listen to.
         """
-        self._closed = True
-
-        if len(self._futures) == 0:
-            return
-        if wait_futures:
-            logger.debug('Waiting on pending futures for %s', self)
-            await asyncio.wait(
-                list(self._futures.values()),
-                timeout=timeout,
-            )
-        else:
-            logger.debug('Cancelling pending futures for %s', self)
-            for future in self._futures:
-                self._futures[future].cancel()
-
-    def closed(self) -> bool:
-        """Check if the handle has been closed."""
-        return self._closed
+        if exchange not in self._registered_exchanges:
+            exchange.register_handle(self)
+            self._registered_exchanges.add(exchange)
 
     async def action(self, action: str, /, *args: Any, **kwargs: Any) -> R:
         """Invoke an action on the agent.
@@ -508,13 +368,12 @@ class RemoteHandle(Generic[AgentT]):
                 typically indicates the agent shutdown for another reason
                 (it self terminated or via another handle).
             Exception: Any exception raised by the action.
-            HandleClosedError: If the handle was closed.
         """
-        if self._closed:
-            raise HandleClosedError(self.agent_id, self.client_id)
+        exchange = self.exchange
+        self._register_with_exchange(exchange)
 
         request = Message.create(
-            src=self.client_id,
+            src=exchange.client_id,
             dest=self.agent_id,
             label=self.handle_id,
             body=ActionRequest(action=action, pargs=args, kargs=kwargs),
@@ -550,14 +409,13 @@ class RemoteHandle(Generic[AgentT]):
             AgentTerminatedError: If the agent's mailbox was closed. This
                 typically indicates the agent shutdown for another reason
                 (it self terminated or via another handle).
-            HandleClosedError: If the handle was closed.
             TimeoutError: If the timeout is exceeded.
         """
-        if self._closed:
-            raise HandleClosedError(self.agent_id, self.client_id)
+        exchange = self.exchange
+        self._register_with_exchange(exchange)
 
         request = Message.create(
-            src=self.client_id,
+            src=exchange.client_id,
             dest=self.agent_id,
             label=self.handle_id,
             body=PingRequest(),
@@ -577,7 +435,7 @@ class RemoteHandle(Generic[AgentT]):
         elapsed = time.perf_counter() - start
         logger.debug(
             'Received ping from %s to %s in %.1f ms',
-            self.client_id,
+            exchange.client_id,
             self.agent_id,
             elapsed * 1000,
         )
@@ -596,13 +454,12 @@ class RemoteHandle(Generic[AgentT]):
             AgentTerminatedError: If the agent's mailbox was closed. This
                 typically indicates the agent shutdown for another reason
                 (it self terminated or via another handle).
-            HandleClosedError: If the handle was closed.
         """
-        if self._closed:
-            raise HandleClosedError(self.agent_id, self.client_id)
+        exchange = self.exchange
+        self._register_with_exchange(exchange)
 
         request = Message.create(
-            src=self.client_id,
+            src=exchange.client_id,
             dest=self.agent_id,
             label=self.handle_id,
             body=ShutdownRequest(terminate=terminate),
@@ -610,6 +467,6 @@ class RemoteHandle(Generic[AgentT]):
         await self.exchange.send(request)
         logger.debug(
             'Sent shutdown request from %s to %s',
-            self.client_id,
+            exchange.client_id,
             self.agent_id,
         )

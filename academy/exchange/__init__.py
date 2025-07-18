@@ -15,6 +15,7 @@ from typing import Generic
 from typing import Protocol
 from typing import runtime_checkable
 from typing import TypeVar
+from weakref import WeakValueDictionary
 
 if sys.version_info >= (3, 11):  # pragma: >=3.11 cover
     from typing import TypeAlias
@@ -166,7 +167,9 @@ class ExchangeClient(abc.ABC, Generic[ExchangeTransportT]):
         transport: ExchangeTransportT,
     ) -> None:
         self._transport = transport
-        self._handles: dict[uuid.UUID, RemoteHandle[Any]] = {}
+        self._handles: WeakValueDictionary[uuid.UUID, RemoteHandle[Any]] = (
+            WeakValueDictionary()
+        )
         self._close_lock = asyncio.Lock()
         self._closed = False
 
@@ -199,12 +202,6 @@ class ExchangeClient(abc.ABC, Generic[ExchangeTransportT]):
     async def close(self) -> None:
         """Close the transport."""
         ...
-
-    async def _close_handles(self) -> None:
-        """Close all handles created by this client."""
-        for key in tuple(self._handles):
-            handle = self._handles.pop(key)
-            await handle.close(wait_futures=False)
 
     async def discover(
         self,
@@ -358,7 +355,6 @@ class AgentExchangeClient(
             if self._closed:
                 return
 
-            await self._close_handles()
             await self._transport.close()
             self._closed = True
             logger.info('Closed exchange client for %s', self.client_id)
@@ -419,13 +415,12 @@ class UserExchangeClient(ExchangeClient[ExchangeTransportT]):
         """Close the user client.
 
         This terminates the user's mailbox, closes the underlying exchange
-        transport, and closes all handles produced by this client.
+        transport.
         """
         async with self._close_lock:
             if self._closed:
                 return
 
-            await self._close_handles()
             await self._transport.terminate(self.client_id)
             logger.info(f'Terminated mailbox for {self.client_id}')
             await self._stop_listener_task()
