@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -16,7 +17,11 @@ from cachetools import TTLCache
 from academy.exception import ForbiddenError
 from academy.exception import UnauthorizedError
 from academy.exchange.cloud.config import ExchangeAuthConfig
-from academy.exchange.cloud.login import AcademyExchangeScopes
+from academy.exchange.cloud.scopes import AcademyExchangeScopes
+from academy.exchange.cloud.scopes import get_academy_exchange_client_id
+from academy.exchange.cloud.scopes import get_academy_exchange_secret
+
+logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -69,9 +74,6 @@ class GlobusAuthenticator:
             Ignored if `auth_client` is provided.
         client_secret: Globus application client secret. See `client_id` for
             details. Ignored if `auth_client` is provided.
-        audience: Intended audience of the token. This should typically be
-            the resource server of the the token was issued for. E.g.,
-            the UUID of the Academy Exchange application.
         token_cache_limit: Maximum number of (token, identity) mappings
             to store in memory.
         token_ttl_s: Time in seconds before invalidating cached tokens.
@@ -82,7 +84,6 @@ class GlobusAuthenticator:
         client_id: str | None = None,
         client_secret: str | None = None,
         *,
-        audience: str = AcademyExchangeScopes.resource_server,
         token_cache_limit: int = 1024,
         token_ttl_s: int = 60,
     ) -> None:
@@ -90,9 +91,10 @@ class GlobusAuthenticator:
         self.executor = ThreadPoolExecutor(
             thread_name_prefix='exchange-auth-thread',
         )
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self.audience = audience
+        self.client_id = client_id or get_academy_exchange_client_id()
+        self.client_secret = client_secret or get_academy_exchange_secret()
+        self.audience = AcademyExchangeScopes.resource_server
+
         self.token_cache = TTLCache(
             maxsize=token_cache_limit,
             ttl=token_ttl_s,
@@ -117,7 +119,10 @@ class GlobusAuthenticator:
         self,
         token: str,
     ) -> globus_sdk.response.GlobusHTTPResponse:
-        return self.auth_client.oauth2_token_introspect(token)
+        response = self.auth_client.oauth2_token_introspect(token)
+        logger.info(f'Authenticated token with globus: {token}.')
+        logger.debug(f'Token introspect response: {response}.')
+        return response
 
     async def authenticate_user(self, headers: Mapping[str, str]) -> str:
         """Authenticate a Globus Auth user from request header.
