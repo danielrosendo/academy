@@ -178,7 +178,7 @@ class RedisExchangeTransport(ExchangeTransportMixin, NoPickleMixin):
                 'Redis server. This means that something incorrectly '
                 'deleted the key.',
             )
-        elif status == _MailboxState.INACTIVE.value:
+        elif status.decode() == _MailboxState.INACTIVE.value:
             raise MailboxTerminatedError(self.mailbox_id)
 
         raw = await self._client.blpop(  # type: ignore[misc]

@@ -679,7 +679,7 @@ class RedisBackend:
         )
         if status is None:
             raise BadEntityIdError(uid)
-        elif status == MailboxStatus.TERMINATED.value:
+        elif status.decode() == MailboxStatus.TERMINATED.value:
             raise MailboxTerminatedError(uid)
 
         await self._update_expirations(uid)
