@@ -139,15 +139,19 @@ class RedisExchangeTransport(ExchangeTransportMixin, NoPickleMixin):
         async for key in self._client.scan_iter(
             'agent:*',
         ):  # pragma: no branch
-            mro_str = await self._client.get(key)
+            mro_str = (await self._client.get(key)).decode('utf-8')
             assert isinstance(mro_str, str)
             mro = mro_str.split(',')
             if fqp == mro[0] or (allow_subclasses and fqp in mro):
-                aid: AgentId[Any] = AgentId(uid=uuid.UUID(key.split(':')[-1]))
+                aid: AgentId[Any] = AgentId(
+                    uid=uuid.UUID(key.decode('utf-8').split(':')[-1]),
+                )
                 found.append(aid)
         active: list[AgentId[Any]] = []
         for aid in found:
-            status = await self._client.get(self._active_key(aid))
+            status = (await self._client.get(self._active_key(aid))).decode(
+                'utf-8',
+            )
             if status == _MailboxState.ACTIVE.value:  # pragma: no branch
                 active.append(aid)
         return tuple(active)
