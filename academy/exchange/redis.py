@@ -135,24 +135,28 @@ class RedisExchangeTransport(ExchangeTransportMixin, NoPickleMixin):
         allow_subclasses: bool = True,
     ) -> tuple[AgentId[Any], ...]:
         found: list[AgentId[Any]] = []
-        fqp = f'{agent.__module__}.{agent.__name__}'
+        fqp_str = f'{agent.__module__}.{agent.__name__}'
+        fqp = fqp_str.encode()
         async for key in self._client.scan_iter(
             'agent:*',
         ):  # pragma: no branch
-            mro_str = (await self._client.get(key)).decode('utf-8')
-            assert isinstance(mro_str, str)
-            mro = mro_str.split(',')
+            mro_str = await self._client.get(key)
+            assert isinstance(mro_str, bytes), (
+                f'mro_str is {type(mro_str)} with repr {mro_str!r}'
+            )
+            mro = mro_str.split(b',')
             if fqp == mro[0] or (allow_subclasses and fqp in mro):
-                aid: AgentId[Any] = AgentId(
-                    uid=uuid.UUID(key.decode('utf-8').split(':')[-1]),
-                )
+                k = key.split(b':')[-1]
+                sk = k.decode()
+                aid: AgentId[Any] = AgentId(uid=uuid.UUID(sk))
                 found.append(aid)
+
         active: list[AgentId[Any]] = []
         for aid in found:
-            status = (await self._client.get(self._active_key(aid))).decode(
-                'utf-8',
-            )
-            if status == _MailboxState.ACTIVE.value:  # pragma: no branch
+            status = await self._client.get(self._active_key(aid))
+            if (
+                status.decode() == _MailboxState.ACTIVE.value
+            ):  # pragma: no branch
                 active.append(aid)
         return tuple(active)
 
@@ -215,7 +219,7 @@ class RedisExchangeTransport(ExchangeTransportMixin, NoPickleMixin):
         status = await self._client.get(self._active_key(message.dest))
         if status is None:
             raise BadEntityIdError(message.dest)
-        elif status == _MailboxState.INACTIVE.value:
+        elif status.decode() == _MailboxState.INACTIVE.value:
             raise MailboxTerminatedError(message.dest)
         else:
             await self._client.rpush(  # type: ignore[misc]
@@ -227,7 +231,7 @@ class RedisExchangeTransport(ExchangeTransportMixin, NoPickleMixin):
         status = await self._client.get(self._active_key(uid))
         if status is None:
             return MailboxStatus.MISSING
-        elif status == _MailboxState.INACTIVE.value:
+        elif status.decode() == _MailboxState.INACTIVE.value:
             return MailboxStatus.TERMINATED
         else:
             return MailboxStatus.ACTIVE

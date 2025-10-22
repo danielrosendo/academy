@@ -225,22 +225,30 @@ class HybridExchangeTransport(ExchangeTransportMixin, NoPickleMixin):
         allow_subclasses: bool = True,
     ) -> tuple[AgentId[Any], ...]:
         found: list[AgentId[Any]] = []
-        fqp = f'{agent.__module__}.{agent.__name__}'
+        fqp_str = f'{agent.__module__}.{agent.__name__}'
+        fqp = fqp_str.encode()
         async for key in self._redis_client.scan_iter(  # pragma: no branch
             f'{self._namespace}:agent:*',
         ):
             mro_str = await self._redis_client.get(key)
-            assert isinstance(mro_str, str)
-            mro = mro_str.split(',')
+            assert isinstance(mro_str, bytes), (
+                f'mro_str is {type(mro_str)} with repr {mro_str!r}'
+            )
+            mro = mro_str.split(b',')
             if fqp == mro[0] or (allow_subclasses and fqp in mro):
+                k = key.split(b':')[-1]
+                sk = k.decode()
                 aid: AgentId[Any] = AgentId(
-                    uid=base32_to_uuid(key.split(':')[-1]),
+                    uid=base32_to_uuid(sk),
                 )
                 found.append(aid)
+
         active: list[AgentId[Any]] = []
         for aid in found:
             status = await self._redis_client.get(self._status_key(aid))
-            if status == _MailboxState.ACTIVE.value:  # pragma: no branch
+            if (
+                status.decode() == _MailboxState.ACTIVE.value
+            ):  # pragma: no branch
                 active.append(aid)
         return tuple(active)
 
@@ -311,7 +319,7 @@ class HybridExchangeTransport(ExchangeTransportMixin, NoPickleMixin):
         status = await self._redis_client.get(self._status_key(message.dest))
         if status is None:
             raise BadEntityIdError(message.dest)
-        elif status == _MailboxState.INACTIVE.value:
+        elif status.decode() == _MailboxState.INACTIVE.value:
             raise MailboxTerminatedError(message.dest)
 
         maybe_address = await self._redis_client.get(
@@ -347,7 +355,7 @@ class HybridExchangeTransport(ExchangeTransportMixin, NoPickleMixin):
         status = await self._redis_client.get(self._status_key(uid))
         if status is None:
             return MailboxStatus.MISSING
-        elif status == _MailboxState.INACTIVE.value:
+        elif status.decode() == _MailboxState.INACTIVE.value:
             return MailboxStatus.TERMINATED
         else:
             return MailboxStatus.ACTIVE
