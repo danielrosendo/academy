@@ -135,20 +135,17 @@ class RedisExchangeTransport(ExchangeTransportMixin, NoPickleMixin):
         allow_subclasses: bool = True,
     ) -> tuple[AgentId[Any], ...]:
         found: list[AgentId[Any]] = []
-        fqp_str = f'{agent.__module__}.{agent.__name__}'
-        fqp = fqp_str.encode()
+        fqp = f'{agent.__module__}.{agent.__name__}'
         async for key in self._client.scan_iter(
             'agent:*',
         ):  # pragma: no branch
-            mro_str = await self._client.get(key)
-            assert isinstance(mro_str, bytes), (
-                f'mro_str is {type(mro_str)} with repr {mro_str!r}'
-            )
-            mro = mro_str.split(b',')
+            mro_str = (await self._client.get(key)).decode()
+            assert isinstance(mro_str, str)
+            mro = mro_str.split(',')
             if fqp == mro[0] or (allow_subclasses and fqp in mro):
-                k = key.split(b':')[-1]
-                sk = k.decode()
-                aid: AgentId[Any] = AgentId(uid=uuid.UUID(sk))
+                aid: AgentId[Any] = AgentId(
+                    uid=uuid.UUID(key.decode().split(':')[-1]),
+                )
                 found.append(aid)
 
         active: list[AgentId[Any]] = []

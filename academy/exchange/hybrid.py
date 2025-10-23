@@ -225,21 +225,17 @@ class HybridExchangeTransport(ExchangeTransportMixin, NoPickleMixin):
         allow_subclasses: bool = True,
     ) -> tuple[AgentId[Any], ...]:
         found: list[AgentId[Any]] = []
-        fqp_str = f'{agent.__module__}.{agent.__name__}'
-        fqp = fqp_str.encode()
-        async for key in self._redis_client.scan_iter(  # pragma: no branch
+        fqp = f'{agent.__module__}.{agent.__name__}'
+        async for key in self._redis_client.scan_iter(
             f'{self._namespace}:agent:*',
-        ):
-            mro_str = await self._redis_client.get(key)
-            assert isinstance(mro_str, bytes), (
-                f'mro_str is {type(mro_str)} with repr {mro_str!r}'
-            )
-            mro = mro_str.split(b',')
+        ):  # pragma: no branch
+            mro_str = (await self._redis_client.get(key)).decode()
+            assert isinstance(mro_str, str)
+            mro = mro_str.split(',')
+            print(mro_str, fqp)
             if fqp == mro[0] or (allow_subclasses and fqp in mro):
-                k = key.split(b':')[-1]
-                sk = k.decode()
                 aid: AgentId[Any] = AgentId(
-                    uid=base32_to_uuid(sk),
+                    uid=base32_to_uuid(key.decode().split(':')[-1]),
                 )
                 found.append(aid)
 

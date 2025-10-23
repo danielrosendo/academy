@@ -21,6 +21,10 @@ class MockRedis:
         self.events: dict[bytes, asyncio.Event] = defaultdict(asyncio.Event)
         self.timeouts: dict[bytes, asyncio.Future[Any]] = {}
 
+        assert (
+            'decode_responses' not in kwargs or not kwargs['decode_responses']
+        ), 'decode_responses is in compatible with the way we use Redis'
+
     def _encode(self, value: bytes | str) -> bytes:
         if isinstance(value, bytes):
             return value

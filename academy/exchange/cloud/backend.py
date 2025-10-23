@@ -621,19 +621,16 @@ class RedisBackend:
             allow_subclasses: Include agents that inherit from the target.
         """
         found: list[AgentId[Any]] = []
-        fqp = agent.encode()
         async for key in self._client.scan_iter(
             'agent:*',
         ):  # pragma: no branch
-            mro_str = await self._client.get(key)
-            assert isinstance(mro_str, bytes), (
-                f'mro_str is {type(mro_str)} with repr {mro_str!r}'
-            )
-            mro = mro_str.split(b',')
-            if fqp == mro[0] or (allow_subclasses and fqp in mro):
-                k = key.split(b':')[-1]
-                sk = k.decode()
-                aid: AgentId[Any] = AgentId(uid=uuid.UUID(sk))
+            mro_str = (await self._client.get(key)).decode()
+            assert isinstance(mro_str, str)
+            mro = mro_str.split(',')
+            if agent == mro[0] or (allow_subclasses and agent in mro):
+                aid: AgentId[Any] = AgentId(
+                    uid=uuid.UUID(key.decode().split(':')[-1]),
+                )
                 found.append(aid)
 
         active: list[AgentId[Any]] = []
