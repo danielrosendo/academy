@@ -9,6 +9,7 @@ import warnings
 from collections.abc import Iterable
 from collections.abc import MutableMapping
 from concurrent.futures import Executor
+from concurrent.futures import ThreadPoolExecutor
 from types import TracebackType
 from typing import Any
 from typing import Generic
@@ -22,14 +23,14 @@ from academy.agent import AgentT
 from academy.exception import AgentTerminatedError
 from academy.exception import BadEntityIdError
 from academy.exception import raise_exceptions
+from academy.exchange import ExchangeClient
 from academy.exchange import ExchangeFactory
-from academy.exchange import UserExchangeClient
 from academy.exchange.transport import AgentRegistration
 from academy.exchange.transport import ExchangeTransportT
 from academy.handle import exchange_context
 from academy.handle import Handle
 from academy.identifier import AgentId
-from academy.identifier import UserId
+from academy.identifier import EntityId
 from academy.logging import init_logging
 from academy.runtime import Runtime
 from academy.runtime import RuntimeConfig
@@ -52,17 +53,9 @@ class _RunSpec(Generic[AgentT, ExchangeTransportT]):
     logfile: str | None = None
 
 
-async def _run_agent_on_worker_async(
+async def _run_agent_async(
     spec: _RunSpec[AgentT, ExchangeTransportT],
 ) -> None:
-    if spec.init_logging:
-        if spec.logfile is not None:
-            logfile = spec.logfile.format(agent_id=spec.registration.agent_id)
-        else:
-            logfile = None
-
-        init_logging(level=spec.loglevel, logfile=logfile)
-
     try:
         if isinstance(spec.agent, type):
             agent = spec.agent(*spec.agent_args, **spec.agent_kwargs)
@@ -88,7 +81,15 @@ def _run_agent_on_worker(
     spec: _RunSpec[AgentT, ExchangeTransportT],
     **kwargs: Any,
 ) -> None:
-    asyncio.run(_run_agent_on_worker_async(spec))
+    if spec.init_logging:
+        if spec.logfile is not None:
+            logfile = spec.logfile.format(agent_id=spec.registration.agent_id)
+        else:
+            logfile = None
+
+        init_logging(level=spec.loglevel, logfile=logfile)
+
+    asyncio.run(_run_agent_async(spec))
 
 
 @dataclasses.dataclass
@@ -102,7 +103,7 @@ class _ACB(Generic[AgentT]):
 class Manager(Generic[ExchangeTransportT], NoPickleMixin):
     """Launch and manage running agents.
 
-    A manager is used to launch agents using one or more
+    A manager is used to launch agents in the current event loop or in
     [`Executors`][concurrent.futures.Executor] and interact with/manage those
     agents.
 
@@ -127,7 +128,9 @@ class Manager(Generic[ExchangeTransportT], NoPickleMixin):
         executors: An executor instance or mapping of names to executors to
             use to run agents. If a single executor is provided, it is set
             as the default executor with name `'default'`, overriding any
-            value of `default_executor`.
+            value of `default_executor`. Setting `executor=None` (the default)
+            or passing `{'name': None, ...}` can be used to launch agents
+            in the current event loop.
         default_executor: Specify the name of the default executor to use
             when not specified in `launch()`.
         max_retries: Maximum number of times to retry running an agent
@@ -140,17 +143,22 @@ class Manager(Generic[ExchangeTransportT], NoPickleMixin):
 
     def __init__(
         self,
-        exchange_client: UserExchangeClient[ExchangeTransportT],
-        executors: Executor | MutableMapping[str, Executor],
+        exchange_client: ExchangeClient[ExchangeTransportT],
+        executors: Executor
+        | MutableMapping[str, Executor | None]
+        | None = None,
         *,
-        default_executor: str | None = None,
+        default_executor: str = 'event_loop',
         max_retries: int = 0,
     ) -> None:
+        self._executors: dict[str, Executor | None] = {'event_loop': None}
         if isinstance(executors, Executor):
-            executors = {'default': executors}
+            self._executors.update({'default': executors})
             default_executor = 'default'
+        elif isinstance(executors, MutableMapping):
+            self._executors.update(executors)
 
-        if default_executor is not None and default_executor not in executors:
+        if default_executor not in self._executors:
             raise ValueError(
                 f'No executor named "{default_executor}" was provided to '
                 'use as the default.',
@@ -159,7 +167,6 @@ class Manager(Generic[ExchangeTransportT], NoPickleMixin):
         self._exchange_client = exchange_client
         self._exchange_factory = exchange_client.factory()
         self._user_id = self._exchange_client.client_id
-        self._executors = executors
         self._default_executor = default_executor
         self._max_retries = max_retries
 
@@ -202,9 +209,11 @@ class Manager(Generic[ExchangeTransportT], NoPickleMixin):
     async def from_exchange_factory(
         cls,
         factory: ExchangeFactory[ExchangeTransportT],
-        executors: Executor | MutableMapping[str, Executor],
+        executors: Executor
+        | MutableMapping[str, Executor | None]
+        | None = None,
         *,
-        default_executor: str | None = None,
+        default_executor: str = 'event_loop',
         max_retries: int = 0,
     ) -> Self:
         """Instantiate a new exchange client and manager from a factory."""
@@ -217,7 +226,7 @@ class Manager(Generic[ExchangeTransportT], NoPickleMixin):
         )
 
     @property
-    def exchange_client(self) -> UserExchangeClient[ExchangeTransportT]:
+    def exchange_client(self) -> ExchangeClient[ExchangeTransportT]:
         """User client for the exchange."""
         return self._exchange_client
 
@@ -227,18 +236,21 @@ class Manager(Generic[ExchangeTransportT], NoPickleMixin):
         return self._exchange_factory
 
     @property
-    def user_id(self) -> UserId:
+    def user_id(self) -> EntityId:
         """Exchange client user ID of this manager."""
         return self._user_id
 
-    async def close(self) -> None:
+    async def close(self, close_exchange: bool = True) -> None:
         """Shutdown the manager and cleanup resources.
 
         1. Request all running agents to shut down.
         1. Wait for all running agents to shut down.
-        1. Close the exchange client.
+        1. Close the exchange client. (if close_exchange)
         1. Shutdown the executors.
         1. Raise an exceptions returned by agents.
+
+        Args:
+            close_exchange: If the exchange_client should be closed.
 
         Raises:
             Exception: Any exceptions raised by agents.
@@ -254,9 +266,12 @@ class Manager(Generic[ExchangeTransportT], NoPickleMixin):
             await acb.task
         logger.debug('All agents have completed')
 
-        await self.exchange_client.close()
+        if close_exchange:
+            await self.exchange_client.close()
+
         for executor in self._executors.values():
-            executor.shutdown(wait=True, cancel_futures=True)
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
 
         exceptions = (acb.task.exception() for acb in self._acbs.values())
         exceptions_only = tuple(e for e in exceptions if e is not None)
@@ -289,13 +304,11 @@ class Manager(Generic[ExchangeTransportT], NoPickleMixin):
         self._executors[name] = executor
         return self
 
-    def set_default_executor(self, name: str | None) -> Self:
+    def set_default_executor(self, name: str) -> Self:
         """Set the default executor by name.
 
         Args:
-            name: Name of the executor to use as default. If `None`, no
-                default executor is set and all calls to `launch()` must
-                specify the executor.
+            name: Name of the executor to use as default.
 
         Returns:
             Self for chaining.
@@ -308,9 +321,9 @@ class Manager(Generic[ExchangeTransportT], NoPickleMixin):
         self._default_executor = name
         return self
 
-    async def _run_agent_in_executor(
+    async def _run_agent(
         self,
-        executor: Executor,
+        executor: Executor | None,
         spec: _RunSpec[AgentT, ExchangeTransportT],
     ) -> None:
         agent_id = spec.registration.agent_id
@@ -342,14 +355,17 @@ class Manager(Generic[ExchangeTransportT], NoPickleMixin):
             )
 
             try:
-                await asyncio.wrap_future(
-                    executor.submit(
-                        _run_agent_on_worker,  # type: ignore[arg-type]
-                        spec,
-                        **spec.submit_kwargs,
-                    ),
-                    loop=loop,
-                )
+                if executor is not None:
+                    await asyncio.wrap_future(
+                        executor.submit(
+                            _run_agent_on_worker,  # type: ignore[arg-type]
+                            spec,
+                            **spec.submit_kwargs,
+                        ),
+                        loop=loop,
+                    )
+                else:
+                    await _run_agent_async(spec)
             except asyncio.CancelledError:  # pragma: no cover
                 logger.warning('Cancelled %s task', agent_id)
                 raise
@@ -393,7 +409,7 @@ class Manager(Generic[ExchangeTransportT], NoPickleMixin):
                 Ignored if `agent` is already an instance.
             config: Agent run configuration.
             executor: Name of the executor instance to use. If `None`, uses
-                the default executor, if specified, otherwise raises an error.
+                the default executor.
             submit_kwargs: Additional arguments to pass to the submit function
                 of the executor (i.e. a resource specification).
             name: Readable name of the agent used when registering a new agent.
@@ -409,13 +425,7 @@ class Manager(Generic[ExchangeTransportT], NoPickleMixin):
         Raises:
             RuntimeError: If `registration` is provided and an agent with
                 that ID has already been executed.
-            ValueError: If no default executor is set and `executor` is not
-                specified.
         """
-        if self._default_executor is None and executor is None:
-            raise ValueError(
-                'Must specify the executor when no default is set.',
-            )
         executor = executor if executor is not None else self._default_executor
         assert executor is not None
         executor_instance = self._executors[executor]
@@ -426,6 +436,18 @@ class Manager(Generic[ExchangeTransportT], NoPickleMixin):
         elif registration.agent_id in self._acbs:
             raise RuntimeError(
                 f'{registration.agent_id} has already been executed.',
+            )
+
+        if init_logging and (
+            executor_instance is None
+            or isinstance(executor_instance, ThreadPoolExecutor)
+        ):
+            warnings.warn(
+                f'`init_logging` was specified for agent '
+                f'{registration.agent_id} running in the same process as the '
+                f'Manager. `init_logging` should only be called once per '
+                f'process.',
+                stacklevel=2,
             )
 
         agent_id = registration.agent_id
@@ -444,15 +466,16 @@ class Manager(Generic[ExchangeTransportT], NoPickleMixin):
         )
 
         task = asyncio.create_task(
-            self._run_agent_in_executor(executor_instance, spec),
-            name=f'manager-run-{agent_id}',
+            self._run_agent(executor_instance, spec),
+            name=f'manager-{executor}-run-{agent_id}',
         )
 
         acb = _ACB(agent_id=agent_id, executor=executor, task=task)
         self._acbs[agent_id] = acb
         handle = self.get_handle(agent_id)
         logger.info('Launched agent (%s; %s)', agent_id, agent)
-        self._warn_executor_overloaded(executor_instance, executor)
+        if executor_instance is not None:
+            self._warn_executor_overloaded(executor_instance, executor)
         return handle
 
     def get_handle(

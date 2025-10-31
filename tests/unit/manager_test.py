@@ -5,9 +5,12 @@ import os
 import pathlib
 import sys
 from concurrent.futures import Future
+from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from typing import Callable
+
+from academy.handle import Handle
 
 if sys.version_info >= (3, 10):  # pragma: >=3.10 cover
     from typing import ParamSpec
@@ -16,13 +19,17 @@ else:  # pragma: <3.10 cover
 
 import pytest
 
+from academy.agent import action
 from academy.agent import Agent
 from academy.exception import BadEntityIdError
+from academy.exception import MailboxTerminatedError
+from academy.exchange import HttpExchangeFactory
 from academy.exchange import LocalExchangeFactory
 from academy.exchange import LocalExchangeTransport
 from academy.exchange import UserExchangeClient
 from academy.manager import Manager
 from testing.agents import EmptyAgent
+from testing.agents import IdentityAgent
 from testing.agents import SleepAgent
 from testing.constant import TEST_CONNECTION_TIMEOUT
 from testing.constant import TEST_SLEEP_INTERVAL
@@ -211,18 +218,6 @@ async def test_multiple_executor(
         await manager.launch(EmptyAgent(), executor='first')
 
 
-@pytest.mark.asyncio
-async def test_multiple_executor_no_default(
-    exchange_client: UserExchangeClient[LocalExchangeTransport],
-) -> None:
-    async with Manager(
-        exchange_client=exchange_client,
-        executors={'first': ThreadPoolExecutor()},
-    ) as manager:
-        with pytest.raises(ValueError, match=r'no default is set\.'):
-            await manager.launch(EmptyAgent())
-
-
 class FailOnStartupAgent(Agent):
     def __init__(self, max_errors: int | None = None) -> None:
         self.errors = 0
@@ -322,21 +317,104 @@ async def test_executor_pass_kwargs(
 # logging already.
 @pytest.mark.asyncio
 async def test_worker_init_logging_no_logfile(
+    http_exchange_factory: HttpExchangeFactory,
+) -> None:
+    async with await Manager.from_exchange_factory(
+        http_exchange_factory,
+        executors=ProcessPoolExecutor(max_workers=1),
+    ) as manager:
+        agent = SleepAgent(TEST_SLEEP_INTERVAL)
+        handle = await manager.launch(agent, init_logging=True)
+        await handle.shutdown()
+        await manager.wait({handle})
+
+
+@pytest.mark.asyncio
+async def test_worker_init_logging_logfile(
+    http_exchange_factory: HttpExchangeFactory,
+    tmp_path: pathlib.Path,
+) -> None:
+    async with await Manager.from_exchange_factory(
+        http_exchange_factory,
+        executors=ProcessPoolExecutor(max_workers=1),
+    ) as manager:
+        filepath = os.path.join(tmp_path, '{agent_id}-log.txt')
+        agent = SleepAgent(TEST_SLEEP_INTERVAL)
+        handle = await manager.launch(
+            agent,
+            init_logging=True,
+            logfile=filepath,
+        )
+        await handle.shutdown()
+        await manager.wait({handle})
+
+
+@pytest.mark.asyncio
+async def test_worker_init_logging_warn(
     manager: Manager[LocalExchangeTransport],
 ) -> None:
     agent = SleepAgent(TEST_SLEEP_INTERVAL)
-    handle = await manager.launch(agent, init_logging=True)
+    with pytest.warns(UserWarning, match='init_logging'):
+        handle = await manager.launch(agent, init_logging=True)
+
     await handle.shutdown()
     await manager.wait({handle})
 
 
 @pytest.mark.asyncio
-async def test_worker_init_logging_logfile(
+async def test_agent_manager_iteraction(
     manager: Manager[LocalExchangeTransport],
-    tmp_path: pathlib.Path,
 ) -> None:
-    filepath = os.path.join(tmp_path, '{agent_id}-log.txt')
-    agent = SleepAgent(TEST_SLEEP_INTERVAL)
-    handle = await manager.launch(agent, init_logging=True, logfile=filepath)
-    await handle.shutdown()
-    await manager.wait({handle})
+    class ChildAgent(Agent):
+        @action
+        async def echo(self, item: str) -> str:
+            return item
+
+    class ParentAgent(Agent):
+        """This is an agent that makes children."""
+
+        async def agent_on_startup(self):
+            self.manager = Manager(
+                self.agent_exchange_client,
+                ThreadPoolExecutor(),
+            )
+
+        async def agent_on_shutdown(self):
+            await self.manager.close(close_exchange=False)
+            return await super().agent_on_shutdown()
+
+        @action
+        async def launch_child(self) -> Handle[ChildAgent]:
+            """Create a child."""
+            return await self.manager.launch(ChildAgent)
+
+    parent = await manager.launch(ParentAgent)
+    child = await parent.launch_child()
+
+    result = await child.echo('hello')
+    assert result == 'hello'
+
+    await manager.shutdown(parent)
+    await manager.wait([parent])
+
+    with pytest.raises(MailboxTerminatedError):
+        await child.echo('hello')
+
+
+@pytest.mark.asyncio
+async def test_event_loop_agent_launch(
+    exchange_client: UserExchangeClient[LocalExchangeTransport],
+):
+    agent = IdentityAgent()
+    async with await Manager.from_exchange_factory(
+        factory=exchange_client.factory(),
+    ) as manager:
+        hdl = await manager.launch(agent)
+        result = await hdl.identity('hello')
+        assert result == 'hello'
+
+        second = await manager.launch(agent, executor='event_loop')
+
+        await hdl.shutdown()
+        await second.shutdown()
+        await manager.wait([hdl, second])
