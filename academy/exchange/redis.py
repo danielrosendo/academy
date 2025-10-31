@@ -10,6 +10,8 @@ from typing import Any
 from typing import Generic
 from typing import NamedTuple
 
+from flowcept.instrumentation.task_capture import FlowceptTask
+
 if sys.version_info >= (3, 11):  # pragma: >=3.11 cover
     from typing import Self
 else:  # pragma: <3.11 cover
@@ -64,10 +66,12 @@ class RedisExchangeTransport(ExchangeTransportMixin, NoPickleMixin):
         redis_client: redis.asyncio.Redis,
         *,
         redis_info: _RedisConnectionInfo,
+        with_flowcept=False,
     ) -> None:
         self._mailbox_id = mailbox_id
         self._client = redis_client
         self._redis_info = redis_info
+        self._with_flowcept = with_flowcept
 
     def _active_key(self, uid: EntityId) -> str:
         return f'active:{uid.uid}'
@@ -85,6 +89,7 @@ class RedisExchangeTransport(ExchangeTransportMixin, NoPickleMixin):
         mailbox_id: EntityId | None = None,
         name: str | None = None,
         redis_info: _RedisConnectionInfo,
+        with_flowcept=False,
     ) -> Self:
         """Instantiate a new transport.
 
@@ -119,7 +124,7 @@ class RedisExchangeTransport(ExchangeTransportMixin, NoPickleMixin):
                 _MailboxState.ACTIVE.value,
             )
             logger.info('Registered %s in exchange', mailbox_id)
-        return cls(mailbox_id, client, redis_info=redis_info)
+        return cls(mailbox_id, client, redis_info=redis_info, with_flowcept=with_flowcept)
 
     @property
     def mailbox_id(self) -> EntityId:
@@ -193,7 +198,12 @@ class RedisExchangeTransport(ExchangeTransportMixin, NoPickleMixin):
         assert len(raw) == 2  # noqa: PLR2004
         if raw[1] == _CLOSE_SENTINEL:  # pragma: no cover
             raise MailboxTerminatedError(self.mailbox_id)
-        return Message.model_deserialize(raw[1])
+
+        message = Message.model_deserialize(raw[1])
+        logger.info(f"With Flowcept? {self._with_flowcept}")
+        if self._with_flowcept:
+            self.record_flowcept_message(message)
+        return message
 
     async def register_agent(
         self,
@@ -212,6 +222,35 @@ class RedisExchangeTransport(ExchangeTransportMixin, NoPickleMixin):
         )
         return RedisAgentRegistration(agent_id=aid)
 
+    def record_flowcept_message(self, message: Message[Any]):
+        if hasattr(message.body, "action"):
+            activity_id = message.body.action
+        else:
+            activity_id = message.body.__class__.__name__
+
+        flowcept_task = FlowceptTask(
+            agent_id=str(message.header.dest.uid),
+            source_agent_id=str(message.header.src.uid),
+            activity_id=activity_id,
+            adapter_id="academy",
+            tags=[str(message.header.tag)],
+            subtype=f"{message.header.kind}",
+        )
+        if message.header.kind == "request":
+            params = {}
+            if hasattr(message.body, "pargs") and len(message.body.pargs):
+                params["pargs"] = message.body.pargs
+            if hasattr(message.body, "kargs") and len(message.body.kargs):
+                params.update(message.body.kargs)
+            if len(params):
+                flowcept_task._task.used = params
+        else:
+            if hasattr(message.body, "result") and message.body.result is not None:
+                flowcept_task._task.generated = {}# message.body.result  # TODO what if it's not a dict?
+
+        logger.info(f"Flowcept: {flowcept_task}")
+        # flowcept_task.send()
+
     async def send(self, message: Message[Any]) -> None:
         status = await self._client.get(self._active_key(message.dest))
         if status is None:
@@ -223,6 +262,9 @@ class RedisExchangeTransport(ExchangeTransportMixin, NoPickleMixin):
                 self._queue_key(message.dest),
                 message.model_serialize(),
             )
+            logger.info(f"Going to send: {message}")
+            if self._with_flowcept:
+                self.record_flowcept_message(message)
 
     async def status(self, uid: EntityId) -> MailboxStatus:
         status = await self._client.get(self._active_key(uid))
@@ -270,8 +312,10 @@ class RedisExchangeFactory(ExchangeFactory[RedisExchangeTransport]):
         self,
         hostname: str,
         port: int,
+        with_flowcept=False,
         **redis_kwargs: Any,
     ) -> None:
+        self.with_flowcept = with_flowcept
         self.redis_info = _RedisConnectionInfo(hostname, port, redis_kwargs)
 
     async def _create_transport(
@@ -285,4 +329,5 @@ class RedisExchangeFactory(ExchangeFactory[RedisExchangeTransport]):
             mailbox_id=mailbox_id,
             name=name,
             redis_info=self.redis_info,
+            with_flowcept=self.with_flowcept
         )
